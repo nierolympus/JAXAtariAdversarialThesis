@@ -324,13 +324,26 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
     def _enemy_step(self, state: PongState) -> PongState:
         should_move = state.step_counter % 8 != 0
         direction = jnp.sign(state.ball_y - state.enemy_y)
-        new_y = state.enemy_y + (direction * self.consts.ENEMY_STEP_SIZE).astype(jnp.int32)
-        
+
+        default_enemy_speed = (direction * self.consts.ENEMY_STEP_SIZE).astype(jnp.int32)
+        # If a wrapper injects an enemy_speed, use it; otherwise keep default tracking speed.
+        effective_enemy_speed = jnp.where(state.enemy_speed != 0, state.enemy_speed, default_enemy_speed).astype(jnp.int32)
+        new_y = state.enemy_y + effective_enemy_speed
+
         enemy_y = jax.lax.cond(
             should_move, lambda _: new_y, lambda _: state.enemy_y, operand=None
         )
-        
-        return state.replace(enemy_y=enemy_y.astype(jnp.int32))
+        next_enemy_speed = jax.lax.cond(
+            should_move,
+            lambda _: effective_enemy_speed,
+            lambda _: jnp.array(0, dtype=jnp.int32),
+            operand=None,
+        )
+
+        return state.replace(
+            enemy_y=enemy_y.astype(jnp.int32),
+            enemy_speed=next_enemy_speed.astype(jnp.int32),
+        )
 
     def _score_and_reset(self, state: PongState) -> PongState:
         player_goal = state.ball_x < 4
@@ -640,3 +653,4 @@ class PongRenderer(JAXGameRenderer):
         raster = self.jr.render_label_selective(raster, enemy_render_x, 3, enemy_digits, enemy_digit_masks, enemy_start_index, enemy_num_to_render, spacing=16)
 
         return self.jr.render_from_palette(raster, self.PALETTE)
+
