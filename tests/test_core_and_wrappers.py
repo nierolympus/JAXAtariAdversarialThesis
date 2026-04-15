@@ -48,12 +48,12 @@ def test_pixel_obs_wrapper_with_stacked_frames(raw_env):
     assert obs.shape == expected_shape, f"Expected shape {expected_shape}, got {obs.shape}"
     
     # Take a step and verify shape remains consistent
-    obs, state, reward, done, info = env.step(state, 0)
+    obs, state, reward, done, _, info = env.step(state, 0)
     assert obs.shape == expected_shape, f"Expected shape {expected_shape}, got {obs.shape}"
 
     # perform 100 steps to get to a state in which the frames should be different
     for _ in range(100):
-        obs, state, reward, done, info = env.step(state, 0)
+        obs, state, reward, done, _, info = env.step(state, 0)
     
     # Verify that frames are in the correct range (0-255 for uint8)
     assert jnp.all(obs >= 0) and jnp.all(obs <= 255), "Pixel values should be in range [0, 255]"
@@ -63,8 +63,8 @@ def test_pixel_and_object_centric_wrapper(raw_env):
     key = jax.random.PRNGKey(0)
     stack_size = 4
     base_env = raw_env
-    atari_env = AtariWrapper(base_env, frame_stack_size=stack_size)
-    env = PixelAndObjectCentricWrapper(atari_env)
+    atari_env = AtariWrapper(base_env)
+    env = PixelAndObjectCentricWrapper(atari_env, frame_stack_size=stack_size)
 
     # 1. Test the space definition
     space = env.observation_space()
@@ -108,8 +108,8 @@ def test_object_centric_wrapper(raw_env):
     """Test ObjectCentricWrapper returns a 2D stacked observation and its space is correct."""
     key = jax.random.PRNGKey(0)
     base_env = raw_env
-    atari_env = AtariWrapper(base_env, frame_stack_size=4)
-    env = ObjectCentricWrapper(atari_env)
+    atari_env = AtariWrapper(base_env)
+    env = ObjectCentricWrapper(atari_env, frame_stack_size=4)
 
     # 1. Test the space definition
     space = env.observation_space()
@@ -124,7 +124,7 @@ def test_object_centric_wrapper(raw_env):
     assert obs.shape == space.shape
 
     # 3. Test the runtime output from step()
-    obs, state, _, _, _ = env.step(state, 2) # Use an action that causes change
+    obs, state, _, _, _, _ = env.step(state, 2) # Use an action that causes change
     assert obs.shape == space.shape
 
 def test_log_wrapper(raw_env):
@@ -158,10 +158,18 @@ def test_log_wrapper(raw_env):
     total_reward = 0.0
     steps = 0
     done = False
-    
+
+    # `done` is the env's returned termination signal (may be influenced by
+    # `episodic_life`). `LogWrapper` logs based on the "real" episode end flag
+    # exposed via `info["returned_episode"]`.
+    logged_done = False
+
     while not done and steps < 100:  # Limit steps to avoid infinite loops
-        obs, state, reward, done, info = env.step(state, 0)  # Use NOOP action
-        total_reward += reward
+        obs, state, reward, done, _, info = env.step(state, 0)  # Use NOOP action
+        logged_done = bool(info.get("returned_episode", False))
+        # LogWrapper sums info["env_reward"] (unclipped frame-skip total), not the returned clipped reward.
+        step_return = info.get("env_reward", reward)
+        total_reward += float(jnp.asarray(step_return).reshape(()))
         steps += 1
         
         # Verify observation format remains consistent
@@ -169,10 +177,10 @@ def test_log_wrapper(raw_env):
         assert jnp.all(obs >= 0) and jnp.all(obs <= 255), "Pixel values should be in range [0, 255]"
         
         # Verify running totals
-        assert state.episode_returns == total_reward * (1 - done)
-        assert state.episode_lengths == steps * (1 - done)
+        assert state.episode_returns == total_reward * (1 - logged_done)
+        assert state.episode_lengths == steps * (1 - logged_done)
         
-        if done:
+        if logged_done:
             # Verify final episode statistics
             assert state.returned_episode_returns == total_reward
             assert state.returned_episode_lengths == steps
@@ -223,8 +231,10 @@ def test_multi_reward_log_wrapper(raw_env):
     done = False
     
     while not done and steps < 100:  # Limit steps to avoid infinite loops
-        obs, state, reward, done, info = env.step(state, 0)  # Use NOOP action
-        total_reward_env += reward
+        obs, state, reward, done, _, info = env.step(state, 0)  # Use NOOP action
+        logged_done = bool(info.get("returned_episode", False))
+        step_return_env = info.get("env_reward", reward)
+        total_reward_env += float(jnp.asarray(step_return_env).reshape(()))
         total_rewards += info["all_rewards"]
         steps += 1
         
@@ -235,11 +245,11 @@ def test_multi_reward_log_wrapper(raw_env):
         assert jnp.all(image_obs >= 0) and jnp.all(image_obs <= 255), "Pixel values should be in range [0, 255]"
         
         # Verify running totals
-        assert state.episode_returns_env == total_reward_env * (1 - done)
-        assert jnp.all(state.episode_returns == total_rewards * (1 - done))
-        assert state.episode_lengths == steps * (1 - done)
+        assert state.episode_returns_env == total_reward_env * (1 - logged_done)
+        assert jnp.all(state.episode_returns == total_rewards * (1 - logged_done))
+        assert state.episode_lengths == steps * (1 - logged_done)
         
-        if done:
+        if logged_done:
             # Verify final episode statistics
             assert state.returned_episode_returns_env == total_reward_env
             assert jnp.all(state.returned_episode_returns == total_rewards)
@@ -255,10 +265,10 @@ def test_flatten_observation_wrapper(raw_env):
     """Test that FlattenObservationWrapper correctly flattens each observation type."""
     key = jax.random.PRNGKey(0)
     base_env = raw_env
-    atari_env = AtariWrapper(base_env, frame_stack_size=4)
+    atari_env = AtariWrapper(base_env)
 
     # --- Test 1: Wrapping ObjectCentricWrapper ---
-    unwrapped_oc = ObjectCentricWrapper(atari_env)
+    unwrapped_oc = ObjectCentricWrapper(atari_env, frame_stack_size=4)
     env_oc = FlattenObservationWrapper(unwrapped_oc)
     
     unwrapped_obs_oc, _ = unwrapped_oc.reset(key)
@@ -270,7 +280,7 @@ def test_flatten_observation_wrapper(raw_env):
     assert jnp.array_equal(obs_oc[:int(get_object_centric_obs_size(base_env.observation_space()))], unwrapped_obs_oc[0])
 
     # --- Test 2: Wrapping PixelObsWrapper ---
-    unwrapped_pix = PixelObsWrapper(atari_env)
+    unwrapped_pix = PixelObsWrapper(atari_env, frame_stack_size=4)
     env_pix = FlattenObservationWrapper(unwrapped_pix)
 
     unwrapped_obs_pix, _ = unwrapped_pix.reset(key)
@@ -290,7 +300,7 @@ def test_flatten_observation_wrapper(raw_env):
     assert jnp.array_equal(obs_pix[:np.prod(base_img_shape)], unwrapped_obs_pix[0].flatten())
 
     # --- Test 3: Wrapping PixelAndObjectCentricWrapper ---
-    unwrapped_both = PixelAndObjectCentricWrapper(atari_env)
+    unwrapped_both = PixelAndObjectCentricWrapper(atari_env, frame_stack_size=4)
     env_both = FlattenObservationWrapper(unwrapped_both)
 
     unwrapped_obs_both, _ = unwrapped_both.reset(key)
@@ -315,11 +325,11 @@ def test_log_wrapper_with_flatten_observation(raw_env):
     """Test that LogWrapper works correctly with FlattenObservationWrapper."""
     key = jax.random.PRNGKey(0)
     base_env = raw_env
-    atari_env = AtariWrapper(base_env, frame_stack_size=4)
+    atari_env = AtariWrapper(base_env)
     
     # Test with a complex observation stack
     # Order: Observation generation (pixel and object-centric) -> Flattening -> Logging
-    core_env = PixelAndObjectCentricWrapper(atari_env)
+    core_env = PixelAndObjectCentricWrapper(atari_env, frame_stack_size=4)
     flattened_env = FlattenObservationWrapper(core_env)
     env = LogWrapper(flattened_env)
 
@@ -334,7 +344,7 @@ def test_log_wrapper_with_flatten_observation(raw_env):
     assert obs[1].ndim == 1 # OC part is 1D
 
     # Take one step
-    obs, state, reward, done, info = env.step(state, 0)
+    obs, state, reward, done, _, info = env.step(state, 0)
 
     # Check that logging info is present and obs is still flattened
     assert "returned_episode" in info
@@ -350,7 +360,7 @@ def test_flatten_observation_wrapper_space_structure(raw_env):
     key = jax.random.PRNGKey(0)
     stack_size = 4
     base_env = raw_env
-    atari_env = AtariWrapper(base_env, frame_stack_size=stack_size)
+    atari_env = AtariWrapper(base_env)
 
     # Wrap the Atari environment with the FlattenObservationWrapper
     flatten_env = FlattenObservationWrapper(atari_env)
@@ -456,19 +466,25 @@ def test_atari_wrapper_features_and_pixel_preprocessing(raw_env):
         def render(self, state):
              return jnp.zeros((210, 160, 3), dtype=jnp.uint8)
 
-    base_env = AtariWrapper(FakeEnv(), frame_skip=4, max_pooling=True, first_fire=False, episodic_life=False, sticky_actions=True)
+    base_env = AtariWrapper(
+        FakeEnv(),
+        first_fire=False,
+        episodic_life=False,
+        sticky_actions=0.0,
+        noop_max=0,
+    )
     _, state = base_env.reset(key)
-    obs, state, _, _, _ = base_env.step(state, 0)
+    obs, state, _, _, _, _ = base_env.step(state, 0)
     
-    expected_max_pooled_frame = jnp.ones((2,2), dtype=jnp.uint8) * 4
+    expected_max_pooled_frame = jnp.ones((2,2), dtype=jnp.uint8)
     
-    assert jnp.array_equal(obs.spaces['features'][-1], expected_max_pooled_frame)
+    assert jnp.array_equal(obs.spaces['features'], expected_max_pooled_frame)
 
     # --- Test 2: PixelObsWrapper Preprocessing ---
     RESIZE_SHAPE = (84, 84)
     STACK_SIZE = 4
-    atari_env = AtariWrapper(raw_env, frame_stack_size=STACK_SIZE)
-    pixel_env = PixelObsWrapper(atari_env, do_pixel_resize=True, pixel_resize_shape=RESIZE_SHAPE, grayscale=True)
+    atari_env = AtariWrapper(raw_env)
+    pixel_env = PixelObsWrapper(atari_env, do_pixel_resize=True, pixel_resize_shape=RESIZE_SHAPE, grayscale=True, frame_stack_size=STACK_SIZE)
     
     space = pixel_env.observation_space()
     expected_shape = (STACK_SIZE, RESIZE_SHAPE[0], RESIZE_SHAPE[1], 1)
@@ -479,8 +495,8 @@ def test_atari_wrapper_features_and_pixel_preprocessing(raw_env):
     assert obs.shape == expected_shape
 
     # --- Test 3: PixelAndObjectCentricWrapper Preprocessing ---
-    atari_env_2 = AtariWrapper(raw_env, frame_stack_size=STACK_SIZE)
-    mixed_env = PixelAndObjectCentricWrapper(atari_env_2, do_pixel_resize=True, pixel_resize_shape=RESIZE_SHAPE, grayscale=True)
+    atari_env_2 = AtariWrapper(raw_env)
+    mixed_env = PixelAndObjectCentricWrapper(atari_env_2, do_pixel_resize=True, pixel_resize_shape=RESIZE_SHAPE, grayscale=True, frame_stack_size=STACK_SIZE)
 
     pix_space, obj_space = mixed_env.observation_space().spaces
     assert pix_space.shape == expected_shape
@@ -542,7 +558,7 @@ def test_native_downscaling_hot_swap(raw_env):
     assert obs.shape == expected_shape, f"Reset observation shape mismatch. Got {obs.shape}"
     
     # Test Step
-    obs, state, reward, done, info = env.step(state, 0)
+    obs, state, reward, done, _, info = env.step(state, 0)
     assert obs.shape == expected_shape, f"Step observation shape mismatch. Got {obs.shape}"
 
     # 6. Verify Values (Sanity Check)
