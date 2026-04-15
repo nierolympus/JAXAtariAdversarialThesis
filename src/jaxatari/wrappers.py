@@ -4,7 +4,7 @@ import functools
 import types
 import warnings
 from typing import Any, Dict, Tuple, Union, Optional, Callable
-from dataclasses import is_dataclass, asdict
+from dataclasses import is_dataclass, asdict, dataclass
 
 import chex
 from flax import struct
@@ -932,6 +932,7 @@ class MultiRewardLogWrapper(JaxatariWrapper):
         info["returned_episode_lengths"] = state.returned_episode_lengths
         info["returned_episode"] = done
         return obs, state, reward, done, info
+
 @dataclass(frozen=True)
 class GenericModSpec:
     """Declarative definition of a single state modification."""

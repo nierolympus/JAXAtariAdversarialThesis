@@ -12,7 +12,7 @@ def test_generic_wrapper_can_unpack_constants_for_pong_and_kangaroo():
     pong_consts = pong_wrapper.get_constants_dict()
     kangaroo_consts = kangaroo_wrapper.get_constants_dict()
 
-    assert "MAX_SPEED" in pong_consts
+    assert "PADDLE_MAX_SPEED" in pong_consts
     assert "MIN_BALL_SPEED" in pong_consts
     assert "MOVEMENT_SPEED" in kangaroo_consts
     assert "LEVEL_1" in kangaroo_consts
@@ -20,9 +20,9 @@ def test_generic_wrapper_can_unpack_constants_for_pong_and_kangaroo():
 
 def test_generic_wrapper_can_override_constants_on_core_env():
     env = GenericStateModWrapper(JaxPong(), mod_specs=[])
-    env.set_constant_overrides({"MAX_SPEED": 9})
+    env.set_constant_overrides({"PADDLE_MAX_SPEED": 9})
 
-    assert int(env._core_env.consts.MAX_SPEED) == 9
+    assert float(env._core_env.consts.PADDLE_MAX_SPEED) == 9.0
 
 
 def test_generic_wrapper_modifies_nested_kangaroo_state_fields():
