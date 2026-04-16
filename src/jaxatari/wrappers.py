@@ -5,10 +5,11 @@ import functools
 import types
 import warnings
 from typing import Any, Dict, Tuple, Union, Optional, Callable
-from dataclasses import is_dataclass, asdict, dataclass
+from dataclasses import is_dataclass, asdict
+from flax import struct
 
 import chex
-from flax import struct
+from chex import PRNGKey
 import jax
 import jax.image as jim
 import jax.numpy as jnp
@@ -27,7 +28,17 @@ class JaxatariWrapper(object):
     # provide proxy access to regular attributes of wrapped object
     def __getattr__(self, name):
         return getattr(self._env, name)
-    
+
+
+def _info_to_dict(info: Any) -> Dict[str, Any]:
+    """Convert env info payloads (namedtuple/dataclass/dict-like) to a mutable dict."""
+    if hasattr(info, "_asdict"):
+        return info._asdict()
+    if is_dataclass(info):
+        return asdict(info)
+    return dict(info)
+
+
 class MultiRewardWrapper(JaxatariWrapper):
     """
     Allows providing multiple reward functions to be computed at every step.
@@ -53,11 +64,7 @@ class MultiRewardWrapper(JaxatariWrapper):
     def step(self, state: EnvState, action: int) -> Tuple[chex.Array, EnvState, float, bool, Dict]: 
         obs, new_state, reward, done, info = self._env.step(state, action)
         all_rewards = self._get_all_rewards(state, new_state)
-        # Convert info to dict: handle NamedTuple (has _asdict) or dataclass (use asdict)
-        if hasattr(info, '_asdict'):
-            info = info._asdict()
-        elif is_dataclass(info):
-            info = asdict(info)
+        info = _info_to_dict(info)
         info["all_rewards"] = all_rewards
         return obs, new_state, reward, done, info 
 
@@ -206,17 +213,7 @@ class AtariWrapper(JaxatariWrapper):
             elif hasattr(state.env_state, "lives_lost"):
                 terminated = jnp.logical_or(terminated, new_env_state.lives_lost > state.env_state.lives_lost)
 
-        if hasattr(infos, '_asdict'):
-            # It's a namedtuple or similar, convert to dict
-            info_items = infos._asdict().items()
-        elif is_dataclass(infos):
-            # It's a dataclass, convert to dict
-            info_items = asdict(infos).items()
-        else:
-            # It's already a dict
-            info_items = infos.items()
-
-        info_dict = {k: v for k, v in info_items}
+        info_dict = _info_to_dict(infos)
 
         next_state = AtariState(new_env_state, next_state_key, state.step + 1, new_action)
 
@@ -475,7 +472,7 @@ class PixelObsWrapper(JaxatariWrapper):
 
         def body_fn(carry, _):
             atari_state, action = carry
-            _, new_atari_state, reward, terminated, truncated, info = self._env.step(atari_state, action)
+            obs, new_atari_state, reward, terminated, truncated, info = self._env.step(atari_state, action)
             return (new_atari_state, action), (new_atari_state.env_state, reward, terminated, truncated, info)
 
         (atari_state, _), (env_states, rewards, terminations, truncations, infos) = jax.lax.scan(
@@ -1041,21 +1038,21 @@ class MultiRewardLogWrapper(JaxatariWrapper):
         info["returned_episode"] = done_
         return obs, state, reward, terminated, truncated, info
 
-@dataclass(frozen=True)
+@struct.dataclass
 class GenericModSpec:
     """Declarative definition of a single state modification."""
 
-    target: str
-    op: str = "add"  # add|sub|decrease|increase|mul|scale|set
-    value: float = 0.0
-    const: Optional[str] = None
-    factor: float = 1.0
-    min_value: Optional[float] = None
-    max_value: Optional[float] = None
-    min_const: Optional[str] = None
-    max_const: Optional[str] = None
-    preserve_sign: bool = False
-    dtype: Any = jnp.int32
+    target: str = struct.field(pytree_node=False)
+    op: str = struct.field(pytree_node=False, default="add")  # add|sub|decrease|increase|mul|scale|set
+    value: float = struct.field(pytree_node=False, default=0.0)
+    const: Optional[str] = struct.field(pytree_node=False, default=None)
+    factor: float = struct.field(pytree_node=False, default=1.0)
+    min_value: Optional[float] = struct.field(pytree_node=False, default=None)
+    max_value: Optional[float] = struct.field(pytree_node=False, default=None)
+    min_const: Optional[str] = struct.field(pytree_node=False, default=None)
+    max_const: Optional[str] = struct.field(pytree_node=False, default=None)
+    preserve_sign: bool = struct.field(pytree_node=False, default=False)
+    dtype: Any = struct.field(pytree_node=False, default=jnp.int32)
 
 
 def _unwrap_env_chain(env: Any) -> Any:
@@ -1185,31 +1182,54 @@ class GenericStateModWrapper(JaxatariWrapper):
         bound_max = self._resolve_bound(spec.max_value, spec.max_const)
         op = spec.op.lower()
 
+        op_to_idx = {
+            "add": 0,
+            "increase": 0,
+            "sub": 1,
+            "decrease": 1,
+            "mul": 2,
+            "scale": 2,
+            "set": 3,
+        }
+        op_idx = op_to_idx.get(op, -1)
+
         def _apply(s):
             current = self._resolve_path(s, target_path)
-            if op in ("add", "increase"):
-                new_value = current + amount
-            elif op in ("sub", "decrease"):
-                new_value = current - amount
-            elif op in ("mul", "scale"):
-                new_value = current * amount
-            elif op == "set":
-                new_value = jnp.broadcast_to(amount, current.shape if hasattr(current, "shape") else ())
-            else:
+
+            if op_idx < 0:
                 raise ValueError(f"Unsupported op '{spec.op}' in GenericModSpec")
 
-            if spec.preserve_sign and (bound_min is not None or bound_max is not None):
+            # Keep op dispatch in JAX primitives to reduce Python branching in hot path.
+            new_value = jax.lax.switch(
+                op_idx,
+                (
+                    lambda x: x + amount,
+                    lambda x: x - amount,
+                    lambda x: x * amount,
+                    lambda x: jnp.broadcast_to(amount, x.shape if hasattr(x, "shape") else ()),
+                ),
+                current,
+            )
+
+            has_min = bound_min is not None
+            has_max = bound_max is not None
+
+            if spec.preserve_sign and (has_min or has_max):
                 sign = jnp.where(new_value < 0, -1, 1)
                 magnitude = jnp.abs(new_value)
-                if bound_min is not None:
+                if has_min and has_max:
+                    magnitude = jnp.clip(magnitude, bound_min, bound_max)
+                elif has_min:
                     magnitude = jnp.maximum(magnitude, bound_min)
-                if bound_max is not None:
+                else:
                     magnitude = jnp.minimum(magnitude, bound_max)
                 new_value = sign * magnitude
             else:
-                if bound_min is not None:
+                if has_min and has_max:
+                    new_value = jnp.clip(new_value, bound_min, bound_max)
+                elif has_min:
                     new_value = jnp.maximum(new_value, bound_min)
-                if bound_max is not None:
+                elif has_max:
                     new_value = jnp.minimum(new_value, bound_max)
 
             if spec.dtype is not None:
@@ -1232,25 +1252,16 @@ class GenericStateModWrapper(JaxatariWrapper):
     @functools.partial(jax.jit, static_argnums=(0,))
     def step(self, state, action, adversary_action=None):
         # Support both new API (separate adversary action) and legacy dict API.
-        if isinstance(action, dict):
-            base_action = action["agent"]
-            mod_action = action.get("adversary", 0)
-        else:
-            base_action = action
-            mod_action = 0 if adversary_action is None else adversary_action
+
+        base_action = action
+        mod_action = 0 if adversary_action is None else adversary_action
 
         mod_action = jnp.asarray(mod_action, dtype=jnp.int32)
 
         obs, next_state, reward, done, info = self._env.step(state, base_action)
         next_state = self._apply_mod(next_state, mod_action)
 
-        if hasattr(info, "_asdict"):
-            info_dict = info._asdict()
-        elif is_dataclass(info):
-            info_dict = asdict(info)
-        else:
-            info_dict = dict(info)
-
+        info_dict = _info_to_dict(info)
         info_dict["mod_action"] = mod_action
         for key, path_parts in self._info_fields.items():
             info_dict[key] = self._resolve_path(next_state, path_parts)
