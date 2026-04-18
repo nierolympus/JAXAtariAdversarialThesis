@@ -1,7 +1,8 @@
 import jax
 import jax.numpy as jnp
 import jaxatari
-from jaxatari.wrappers import PongStateModWrapper
+from jaxatari.wrappers import PongStateModWrapper, AtariWrapper
+
 
 
 def _to_scalar(x):
@@ -31,7 +32,7 @@ def main():
     rng = jax.random.PRNGKey(0)
 
     base_env = jaxatari.make("pong")
-    adv_env = PongStateModWrapper(jaxatari.make("pong"))
+    adv_env = AtariWrapper(PongStateModWrapper(jaxatari.make("pong")))
 
     # --- A) Base vs Adv(mod=0) should stay identical ---
     _, base_state = base_env.reset(rng)
