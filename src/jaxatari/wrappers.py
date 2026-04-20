@@ -1107,6 +1107,7 @@ class GenericStateModWrapper(JaxatariWrapper):
         super().__init__(env)
         self._action_space = self._env.action_space()
         self._core_env = _unwrap_env_chain(self._env)
+        self._has_get_observation = hasattr(self._env, "_get_observation")
         self._mod_specs = mod_specs
         self._info_fields = {
             key: tuple(path.split(".")) for key, path in (info_fields or {}).items()
@@ -1227,23 +1228,29 @@ class GenericStateModWrapper(JaxatariWrapper):
             has_min = bound_min is not None
             has_max = bound_max is not None
 
-            if spec.preserve_sign and (has_min or has_max):
-                sign = jnp.where(new_value < 0, -1, 1)
-                magnitude = jnp.abs(new_value)
+            def _apply_bounds_preserve_sign(x):
+                sign = jnp.where(x < 0, -1, 1)
+                magnitude = jnp.abs(x)
                 if has_min and has_max:
                     magnitude = jnp.clip(magnitude, bound_min, bound_max)
                 elif has_min:
                     magnitude = jnp.maximum(magnitude, bound_min)
-                else:
-                    magnitude = jnp.minimum(magnitude, bound_max)
-                new_value = sign * magnitude
-            else:
-                if has_min and has_max:
-                    new_value = jnp.clip(new_value, bound_min, bound_max)
-                elif has_min:
-                    new_value = jnp.maximum(new_value, bound_min)
                 elif has_max:
-                    new_value = jnp.minimum(new_value, bound_max)
+                    magnitude = jnp.minimum(magnitude, bound_max)
+                return sign * magnitude
+
+            def _apply_bounds_regular(x):
+                if has_min and has_max:
+                    return jnp.clip(x, bound_min, bound_max)
+                if has_min:
+                    return jnp.maximum(x, bound_min)
+                if has_max:
+                    return jnp.minimum(x, bound_max)
+                return x
+
+            # Build-time branch: avoids a runtime cond for static spec/bound configuration.
+            apply_bounds_fn = _apply_bounds_preserve_sign if (spec.preserve_sign and (has_min or has_max)) else _apply_bounds_regular
+            new_value = apply_bounds_fn(new_value)
 
             if spec.dtype is not None:
                 new_value = new_value.astype(spec.dtype)
@@ -1262,15 +1269,27 @@ class GenericStateModWrapper(JaxatariWrapper):
         clipped_mod_action = jnp.clip(mod_action, 0, len(self._mod_fns) - 1)
         return jax.lax.switch(clipped_mod_action, self._mod_fns, state)
 
-    @functools.partial(jax.jit, static_argnums=(0,))
-    def step(self, state, action, adversary_action=None):
-        # Support both new API (separate adversary action) and legacy dict API.
-
+    def _normalize_step_actions(self, action, adversary_action):
+        """Normalize all supported call patterns to stable scalar action tensors."""
         base_action = action
-        mod_action = 0 if adversary_action is None else adversary_action
+        mod_action = adversary_action
 
+        # Legacy dict API support outside JIT to keep the hot path type-stable.
+        if isinstance(action, dict):
+            base_action = action.get("action", action.get("base_action", action.get("agent_action", 0)))
+            if mod_action is None:
+                mod_action = action.get("adversary_action", action.get("mod_action", 0))
+
+        if mod_action is None:
+            mod_action = 0
+
+        base_action = jnp.asarray(base_action, dtype=jnp.int32)
         mod_action = jnp.asarray(mod_action, dtype=jnp.int32)
+        mod_action = jnp.clip(mod_action, 0, len(self._mod_fns) - 1)
+        return base_action, mod_action
 
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _step_impl(self, state, base_action, mod_action):
         obs, next_state, reward, done, info = self._env.step(state, base_action)
         next_state = self._apply_mod(next_state, mod_action)
 
@@ -1279,10 +1298,14 @@ class GenericStateModWrapper(JaxatariWrapper):
         for key, path_parts in self._info_fields.items():
             info_dict[key] = self._resolve_path(next_state, path_parts)
 
-        if hasattr(self._env, "_get_observation"):
+        if self._has_get_observation:
             obs = self._env._get_observation(next_state)
 
         return obs, next_state, reward, done, info_dict
+
+    def step(self, state, action, adversary_action=None):
+        base_action, mod_action = self._normalize_step_actions(action, adversary_action)
+        return self._step_impl(state, base_action, mod_action)
 
 
 class PongStateModWrapper(GenericStateModWrapper):
