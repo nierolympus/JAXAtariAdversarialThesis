@@ -1076,6 +1076,18 @@ def _unwrap_env_chain(env: Any) -> Any:
         core_env = core_env._env
     return core_env
 
+
+def _has_wrapper_in_chain(env: Any, wrapper_type: type) -> bool:
+    """Checks whether a wrapper type appears anywhere in the `_env` chain."""
+    current = env
+    for _ in range(128):
+        if isinstance(current, wrapper_type):
+            return True
+        if not hasattr(current, "_env"):
+            return False
+        current = current._env
+    return False
+
 def _to_plain_mapping(value: Any) -> Any:
     """Recursively convert constants objects into plain dict/list/scalars."""
     if isinstance(value, dict):
@@ -1107,16 +1119,45 @@ class GenericStateModWrapper(JaxatariWrapper):
         super().__init__(env)
         self._action_space = self._env.action_space()
         self._core_env = _unwrap_env_chain(self._env)
-        self._has_get_observation = hasattr(self._env, "_get_observation")
+        assert _has_wrapper_in_chain(self._env, AtariWrapper), "GenericStateModWrapper should be the last wrapper on top of a chain that includes AtariWrapper"
+        self._state_prefix = self._infer_state_prefix()
         self._mod_specs = mod_specs
         self._info_fields = {
-            key: tuple(path.split(".")) for key, path in (info_fields or {}).items()
+            key: self._state_prefix + tuple(path.split(".")) for key, path in (info_fields or {}).items()
         }
 
         if constant_overrides:
             self.set_constant_overrides(constant_overrides)
 
         self._mod_fns = self._build_mod_fns()
+
+    def _infer_state_prefix(self) -> tuple[str, ...]:
+        """Infer the path from outer wrapper state to core Atari env_state."""
+        prefix: list[str] = []
+        current = self._env
+
+        wrappers_with_atari_state = (
+            ObjectCentricWrapper,
+            PixelObsWrapper,
+            PixelAndObjectCentricWrapper,
+            PixelAndObjectObsWrapper,
+            LogWrapper,
+            MultiRewardLogWrapper,
+        )
+
+        for _ in range(64):
+            if isinstance(current, AtariWrapper):
+                prefix.append("env_state")
+                return tuple(prefix)
+
+            if isinstance(current, wrappers_with_atari_state):
+                prefix.append("atari_state")
+
+            if not hasattr(current, "_env"):
+                break
+            current = current._env
+
+        raise ValueError("Could not infer state path to Atari env_state; ensure GenericStateModWrapper is applied last")
 
     def action_space(self) -> spaces.Space:
         return self._action_space
@@ -1190,7 +1231,7 @@ class GenericStateModWrapper(JaxatariWrapper):
         return None
 
     def _compile_spec_fn(self, spec: GenericModSpec):
-        target_path = tuple(spec.target.split("."))
+        target_path = self._state_prefix + tuple(spec.target.split("."))
         amount = self._resolve_amount(spec)
         bound_min = self._resolve_bound(spec.min_value, spec.min_const)
         bound_max = self._resolve_bound(spec.max_value, spec.max_const)
@@ -1276,9 +1317,9 @@ class GenericStateModWrapper(JaxatariWrapper):
 
         # Legacy dict API support outside JIT to keep the hot path type-stable.
         if isinstance(action, dict):
-            base_action = action.get("action", action.get("base_action", action.get("agent_action", 0)))
+            base_action = action.get("action", action.get("base_action", action.get("agent_action", action.get("agent", 0))))
             if mod_action is None:
-                mod_action = action.get("adversary_action", action.get("mod_action", 0))
+                mod_action = action.get("adversary_action", action.get("mod_action", action.get("adversary", 0)))
 
         if mod_action is None:
             mod_action = 0
@@ -1290,18 +1331,27 @@ class GenericStateModWrapper(JaxatariWrapper):
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def _step_impl(self, state, base_action, mod_action):
-        obs, next_state, reward, done, info = self._env.step(state, base_action)
-        next_state = self._apply_mod(next_state, mod_action)
+        # Keep order explicit: apply adversarial state mod first, then execute wrapped env.step.
+        mod_state = self._apply_mod(state, mod_action)
+        step_out = self._env.step(mod_state, base_action)
+
+        # Normalize wrapped step output to (obs, next_state, reward, terminated, truncated, info).
+        if len(step_out) == 6:
+            obs, next_state, reward, terminated, truncated, info = step_out
+        elif len(step_out) == 5:
+            obs, next_state, reward, done, info = step_out
+            terminated = done
+            truncated = jnp.bool_(False)
+        else:
+            raise ValueError("Wrapped step output must have length 5 or 6")
 
         info_dict = _info_to_dict(info)
         info_dict["mod_action"] = mod_action
         for key, path_parts in self._info_fields.items():
             info_dict[key] = self._resolve_path(next_state, path_parts)
 
-        if self._has_get_observation:
-            obs = self._env._get_observation(next_state)
 
-        return obs, next_state, reward, done, info_dict
+        return obs, next_state, reward, terminated, truncated, info_dict
 
     def step(self, state, action, adversary_action=None):
         base_action, mod_action = self._normalize_step_actions(action, adversary_action)
