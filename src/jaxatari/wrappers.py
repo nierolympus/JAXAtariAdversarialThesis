@@ -1103,6 +1103,26 @@ def _to_plain_mapping(value: Any) -> Any:
     return value
 
 
+def _get_core_env_state(state: Any) -> Optional[Any]:
+    """Finds the core env_state by treating AtariState as a leaf."""
+    leaves = jax.tree.leaves(state, is_leaf=lambda x: isinstance(x, AtariState))
+    for leaf in leaves:
+        if isinstance(leaf, AtariState):
+            return leaf.env_state
+    return None
+
+
+def _set_core_env_state(state: Any, new_env_state: Any) -> Any:
+    """Sets the core env_state by transforming the tree, treating AtariState as a leaf."""
+
+    def _replace_fn(leaf):
+        if isinstance(leaf, AtariState):
+            return leaf.replace(env_state=new_env_state)
+        return leaf
+
+    return jax.tree.map(_replace_fn, state, is_leaf=lambda x: isinstance(x, AtariState))
+
+
 class GenericStateModWrapper(JaxatariWrapper):
     """
     Generic adversarial wrapper for state modifications via declarative mod specs.
@@ -1119,45 +1139,16 @@ class GenericStateModWrapper(JaxatariWrapper):
         super().__init__(env)
         self._action_space = self._env.action_space()
         self._core_env = _unwrap_env_chain(self._env)
-        assert _has_wrapper_in_chain(self._env, AtariWrapper), "GenericStateModWrapper should be the last wrapper on top of a chain that includes AtariWrapper"
-        self._state_prefix = self._infer_state_prefix()
+        assert _has_wrapper_in_chain(
+            self._env, AtariWrapper
+        ), "GenericStateModWrapper should be the last wrapper on top of a chain that includes AtariWrapper"
         self._mod_specs = mod_specs
-        self._info_fields = {
-            key: self._state_prefix + tuple(path.split(".")) for key, path in (info_fields or {}).items()
-        }
+        self._info_fields = {key: tuple(path.split(".")) for key, path in (info_fields or {}).items()}
 
         if constant_overrides:
             self.set_constant_overrides(constant_overrides)
 
         self._mod_fns = self._build_mod_fns()
-
-    def _infer_state_prefix(self) -> tuple[str, ...]:
-        """Infer the path from outer wrapper state to core Atari env_state."""
-        prefix: list[str] = []
-        current = self._env
-
-        wrappers_with_atari_state = (
-            ObjectCentricWrapper,
-            PixelObsWrapper,
-            PixelAndObjectCentricWrapper,
-            PixelAndObjectObsWrapper,
-            LogWrapper,
-            MultiRewardLogWrapper,
-        )
-
-        for _ in range(64):
-            if isinstance(current, AtariWrapper):
-                prefix.append("env_state")
-                return tuple(prefix)
-
-            if isinstance(current, wrappers_with_atari_state):
-                prefix.append("atari_state")
-
-            if not hasattr(current, "_env"):
-                break
-            current = current._env
-
-        raise ValueError("Could not infer state path to Atari env_state; ensure GenericStateModWrapper is applied last")
 
     def action_space(self) -> spaces.Space:
         return self._action_space
@@ -1167,41 +1158,44 @@ class GenericStateModWrapper(JaxatariWrapper):
         return _to_plain_mapping(self._core_env.consts)
 
     def _resolve_path(self, obj: Any, path_parts: tuple[str, ...]) -> Any:
-        current = obj
-        for part in path_parts:
-            if isinstance(current, dict):
-                current = current[part]
-            else:
-                current = getattr(current, part)
-        return current
+        """Recursively access a nested attribute using a path."""
+
+        def _getter(inner_obj, key):
+            return inner_obj[key] if isinstance(inner_obj, dict) else getattr(inner_obj, key)
+
+        return functools.reduce(_getter, path_parts, obj)
 
     def _set_path(self, obj: Any, path_parts: tuple[str, ...], value: Any) -> Any:
-        head = path_parts[0]
-        if len(path_parts) == 1:
+        """Recursively and immutably update a nested attribute using a path."""
+        head, *tail = path_parts
+
+        if not tail:
+            # Base case: reached the target, create updated object
             if isinstance(obj, dict):
-                out = dict(obj)
-                out[head] = value
-                return out
+                new_obj = obj.copy()
+                new_obj[head] = value
+                return new_obj
             if hasattr(obj, "replace"):
                 return obj.replace(**{head: value})
-            if hasattr(obj, "_replace"):
+            if hasattr(obj, "_replace"):  # for namedtuples
                 return obj._replace(**{head: value})
-            setattr(obj, head, value)
-            return obj
+            raise TypeError(f"Object of type {type(obj)} at path does not support immutable update (dict, replace, _replace).")
 
+        # Recursive step: drill down
         child = obj[head] if isinstance(obj, dict) else getattr(obj, head)
-        new_child = self._set_path(child, path_parts[1:], value)
+        new_child = self._set_path(child, tail, value)
 
+        # Reconstruct the parent object with the updated child
         if isinstance(obj, dict):
-            out = dict(obj)
-            out[head] = new_child
-            return out
+            new_obj = obj.copy()
+            new_obj[head] = new_child
+            return new_obj
         if hasattr(obj, "replace"):
             return obj.replace(**{head: new_child})
         if hasattr(obj, "_replace"):
             return obj._replace(**{head: new_child})
-        setattr(obj, head, new_child)
-        return obj
+        # This path should not be hit if the base case has a check
+        raise TypeError(f"Object of type {type(obj)} in path does not support immutable update.")
 
     def _resolve_const(self, path: str) -> Any:
         return self._resolve_path(self._core_env.consts, tuple(path.split(".")))
@@ -1231,7 +1225,7 @@ class GenericStateModWrapper(JaxatariWrapper):
         return None
 
     def _compile_spec_fn(self, spec: GenericModSpec):
-        target_path = self._state_prefix + tuple(spec.target.split("."))
+        target_path = tuple(spec.target.split("."))
         amount = self._resolve_amount(spec)
         bound_min = self._resolve_bound(spec.min_value, spec.min_const)
         bound_max = self._resolve_bound(spec.max_value, spec.max_const)
@@ -1249,7 +1243,11 @@ class GenericStateModWrapper(JaxatariWrapper):
         op_idx = op_to_idx.get(op, -1)
 
         def _apply(s):
-            current = self._resolve_path(s, target_path)
+            core_state = _get_core_env_state(s)
+            if core_state is None:
+                raise ValueError("Could not find AtariState leaf in the state tree.")
+
+            current = self._resolve_path(core_state, target_path)
 
             if op_idx < 0:
                 raise ValueError(f"Unsupported op '{spec.op}' in GenericModSpec")
@@ -1296,7 +1294,8 @@ class GenericStateModWrapper(JaxatariWrapper):
             if spec.dtype is not None:
                 new_value = new_value.astype(spec.dtype)
 
-            return self._set_path(s, target_path, new_value)
+            new_core_state = self._set_path(core_state, target_path, new_value)
+            return _set_core_env_state(s, new_core_state)
 
         return _apply
 
@@ -1336,20 +1335,18 @@ class GenericStateModWrapper(JaxatariWrapper):
         step_out = self._env.step(mod_state, base_action)
 
         # Normalize wrapped step output to (obs, next_state, reward, terminated, truncated, info).
-        if len(step_out) == 6:
-            obs, next_state, reward, terminated, truncated, info = step_out
-        elif len(step_out) == 5:
-            obs, next_state, reward, done, info = step_out
-            terminated = done
-            truncated = jnp.bool_(False)
-        else:
-            raise ValueError("Wrapped step output must have length 5 or 6")
+
+        obs, next_state, reward, terminated, truncated, info = step_out
+
+
 
         info_dict = _info_to_dict(info)
         info_dict["mod_action"] = mod_action
-        for key, path_parts in self._info_fields.items():
-            info_dict[key] = self._resolve_path(next_state, path_parts)
 
+        core_env_state = _get_core_env_state(next_state)
+
+        for key, path_parts in self._info_fields.items():
+            info_dict[key] = self._resolve_path(core_env_state, path_parts)
 
         return obs, next_state, reward, terminated, truncated, info_dict
 
@@ -1366,24 +1363,16 @@ class PongStateModWrapper(GenericStateModWrapper):
     def __init__(self, env):
         # Keep action IDs stable: 1..10 are valid mod actions; 5/6 are no-ops for backward compatibility.
         specs = [
-            GenericModSpec(target="player_speed", op="decrease", value=1.0, min_const="PADDLE_MAX_SPEED", max_const="PADDLE_MAX_SPEED", preserve_sign=True, dtype=jnp.float32),
-            GenericModSpec(target="player_speed", op="add", value=1.0, min_const="PADDLE_MAX_SPEED", max_const="PADDLE_MAX_SPEED", preserve_sign=True, dtype=jnp.float32),
-            GenericModSpec(target="enemy_speed", op="decrease", value=1, dtype=jnp.int32),
-            GenericModSpec(target="enemy_speed", op="add", value=1, dtype=jnp.int32),
-            GenericModSpec(target="enemy_speed", op="add", value=0, dtype=jnp.int32),
-            GenericModSpec(target="enemy_speed", op="add", value=0, dtype=jnp.int32),
-            GenericModSpec(target="ball_vel_x", op="decrease", value=1, min_const="MIN_BALL_SPEED", max_const="BALL_MAX_SPEED", preserve_sign=True, dtype=jnp.int32),
-            GenericModSpec(target="ball_vel_x", op="add", value=1, min_const="MIN_BALL_SPEED", max_const="BALL_MAX_SPEED", preserve_sign=True, dtype=jnp.int32),
-            GenericModSpec(target="ball_vel_y", op="decrease", value=1, min_const="MIN_BALL_SPEED", max_const="BALL_MAX_SPEED", preserve_sign=True, dtype=jnp.int32),
-            GenericModSpec(target="ball_vel_y", op="add", value=1, min_const="MIN_BALL_SPEED", max_const="BALL_MAX_SPEED", preserve_sign=True, dtype=jnp.int32),
+            GenericModSpec(target="ball_vel_x", op="mul", value=1.1, min_const="MIN_BALL_SPEED", max_const="BALL_MAX_SPEED", preserve_sign=True, dtype=jnp.float32),
+            GenericModSpec(target="ball_vel_x", op="mul", value=0.9, min_const="MIN_BALL_SPEED", max_const="BALL_MAX_SPEED", preserve_sign=True, dtype=jnp.float32),
+            GenericModSpec(target="ball_vel_y", op="mul", value=1.1, min_const="MIN_BALL_SPEED", max_const="BALL_MAX_SPEED", preserve_sign=True, dtype=jnp.float32),
+            GenericModSpec(target="ball_vel_y", op="mul", value=0.9, min_const="MIN_BALL_SPEED", max_const="BALL_MAX_SPEED", preserve_sign=True, dtype=jnp.float32),
         ]
 
         super().__init__(
             env,
             mod_specs=specs,
             info_fields={
-                "player_speed": "player_speed",
-                "enemy_speed": "enemy_speed",
                 "ball_vel_x": "ball_vel_x",
                 "ball_vel_y": "ball_vel_y",
             },
