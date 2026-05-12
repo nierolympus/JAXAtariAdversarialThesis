@@ -29,10 +29,6 @@ ADV_MODE: "prob"
 ADV_PROB: 0.05
 
 
-  """
-ADV_MODE: \"every_n\"
-ADV_EVERY_N: 8
-"""
 
 
 TEST_DURING_TRAINING: False
@@ -41,4 +37,3 @@ TEST_NUM_ENVS: 1024
 TEST_NUM_STEPS: 10000
 EPS_TEST: 0.0
 RECORD_VIDEO: True
-

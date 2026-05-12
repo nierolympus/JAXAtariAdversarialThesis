@@ -28,6 +28,9 @@ def main() -> None:
     sys.path.insert(0, str(root))
 
     module_path = root / "scripts" / "benchmarks" / "pqn_agent_adv_random.py"
+    benchmarks_path = str(module_path.parent)
+    if benchmarks_path not in sys.path:
+        sys.path.insert(0, benchmarks_path)
     spec = importlib.util.spec_from_file_location("pqn_agent_adv_random", module_path)
     pqn_agent_adv_random = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pqn_agent_adv_random)
@@ -38,4 +41,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
