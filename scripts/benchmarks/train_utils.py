@@ -8,15 +8,24 @@ import wandb
 from safetensors.flax import save_file, load_file
 from flax.traverse_util import flatten_dict, unflatten_dict
 
-def video_callback(states, dones, step, renderer, mod=False, mod_name=None):
+def video_callback(
+    states,
+    dones,
+    step,
+    renderer,
+    mod=False,
+    mod_name=None,
+    mod_actions=None,
+    adversary_video=False,
+):
     """
     Starting a new thread to render video so that it doesn't block training.
     """
     # video_thread = threading.Thread(target=video_renderer, args=(states, dones, step, renderer, mod))
     # video_thread.start()
-    video_renderer(states, dones, step, renderer, mod, mod_name)
+    video_renderer(states, dones, step, renderer, mod, mod_name, mod_actions, adversary_video)
 
-def video_renderer(states, dones, step, renderer, mod, mod_name):
+def video_renderer(states, dones, step, renderer, mod, mod_name, mod_actions, adversary_video):
     print("Rendering video...")
     video_folder = f"{wandb.run.dir}/media/videos/"
     os.makedirs(video_folder, exist_ok=True)
@@ -37,6 +46,43 @@ def video_renderer(states, dones, step, renderer, mod, mod_name):
     states_reduced = jax.tree_util.tree_map(lambda x: x[:num_states], states)
     rasters = jax.vmap(renderer.render)(states_reduced)
     frames = np.array(rasters, dtype=np.uint8)
+
+    if adversary_video and mod_actions is not None:
+        actions = np.array(mod_actions)
+        if actions.ndim > 1:
+            actions = actions[:, 0]
+        actions = actions[:num_states]
+        max_action = max(int(np.max(actions)) if len(actions) else 0, 1)
+        active = actions != 0
+
+        # Add a visible top strip: gray=no adversary action, colored=adversary action id.
+        palette = np.array(
+            [
+                [80, 80, 80],
+                [230, 57, 70],
+                [29, 185, 84],
+                [69, 123, 157],
+                [255, 183, 3],
+                [131, 56, 236],
+                [251, 86, 7],
+                [0, 180, 216],
+            ],
+            dtype=np.uint8,
+        )
+        colors = palette[actions.astype(np.int32) % len(palette)]
+        frames[:, :4, :, :] = colors[:, None, None, :]
+
+        action_counts = {
+            f"adversary_action_{int(action)}": int(count)
+            for action, count in zip(*np.unique(actions, return_counts=True))
+        }
+        wandb.log(
+            {
+                f"adversary_video_active_fraction_{step}": float(active.mean()) if len(active) else 0.0,
+                f"adversary_video_max_action_{step}": max_action,
+                f"adversary_video_action_counts_{step}": action_counts,
+            }
+        )
     # shape currently is (N, W, H, 3)
     # but should be (N, 3, W, H)
     frames = np.transpose(frames, (0, 3, 1, 2))
@@ -50,6 +96,8 @@ def video_renderer(states, dones, step, renderer, mod, mod_name):
             name = f"video_{step}_mod_{safe_mod_name}"
         else:
             name = f"video_{step}_mod"
+    if adversary_video:
+        name = f"{name}_adversary"
     wandb.log({name: video})
     print("Video done.")
 

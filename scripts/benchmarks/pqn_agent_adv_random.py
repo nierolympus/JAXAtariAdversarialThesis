@@ -217,6 +217,7 @@ def make_train(config):
         if not hasattr(env, "_mod_fns"):
             raise ValueError("Adversarial wrapper missing _mod_fns; expected GenericStateModWrapper")
         mod_action_space_n = len(env._mod_fns)
+        print(len(env._mod_fns))
     else:
         mod_action_space_n = 1
 
@@ -550,6 +551,7 @@ def make_train(config):
             infos, env_states, dones = output[0], output[1], output[2]
 
             if config.get("RECORD_VIDEO", False):
+                video_mod_actions = infos["mod_action"] if adv_enabled else jnp.zeros_like(dones)
                 jax.lax.cond(
                     train_state.n_updates > 0,
                     lambda _: jax.debug.callback(
@@ -559,6 +561,8 @@ def make_train(config):
                         train_state.n_updates,
                         renderer,
                         mod=mod,
+                        mod_actions=video_mod_actions,
+                        adversary_video=config.get("LOG_ADVERSARY_VIDEO", False),
                     ),
                     lambda _: None,
                     operand=None,
@@ -608,6 +612,7 @@ def _generate_single_final_video(
     video_label,
     video_index=0,
     env_step=None,
+    adversary_video=False,
 ):
     """Generate a single video for the given mod configuration and log it to wandb."""
     env = jaxatari.make(config["ENV_NAME"].lower(), mods=mods_config)
@@ -633,6 +638,16 @@ def _generate_single_final_video(
     env = NormalizeObservationWrapper(env)
     env = LogWrapper(env)
 
+    adv_enabled = bool(adversary_video and config.get("ADV_RANDOM", False))
+    if adv_enabled:
+        adv_wrapper = config.get("ADV_WRAPPER", None)
+        if adv_wrapper is None or adv_wrapper.lower() != "pong":
+            raise ValueError(f"Unsupported ADV_WRAPPER for final adversary video: {adv_wrapper}")
+        env = PongStateModWrapper(env)
+        mod_action_space_n = len(env._mod_fns)
+    else:
+        mod_action_space_n = 1
+
     # Create network
     network = QNetwork(
         action_dim=env.action_space().n,
@@ -649,6 +664,7 @@ def _generate_single_final_video(
     obs, env_state = env.reset(reset_rng)
 
     frames = []
+    mod_actions = []
     total_reward = 0.0
     max_steps = config.get("VIDEO_MAX_STEPS", 5000)
 
@@ -673,7 +689,26 @@ def _generate_single_final_video(
 
         # Step environment
         rng, step_rng = jax.random.split(rng)
-        obs, env_state, reward, terminated, truncated, info = env.step(env_state, action)
+        if adv_enabled:
+            rng, mod_rng, mask_rng = jax.random.split(rng, 3)
+            mod_action = jax.random.randint(
+                mod_rng, shape=(), minval=0, maxval=mod_action_space_n
+            )
+            adv_mode = config.get("ADV_MODE", "per_step")
+            if adv_mode == "prob":
+                apply_mask = jax.random.bernoulli(
+                    mask_rng, float(config.get("ADV_PROB", 1.0)), shape=()
+                )
+                mod_action = jnp.where(apply_mask, mod_action, 0)
+            elif adv_mode == "every_n":
+                apply_step = (step % int(config.get("ADV_EVERY_N", 1))) == 0
+                mod_action = jnp.where(apply_step, mod_action, 0)
+            obs, env_state, reward, terminated, truncated, info = env.step(
+                env_state, action, mod_action
+            )
+            mod_actions.append(int(jax.device_get(info["mod_action"])))
+        else:
+            obs, env_state, reward, terminated, truncated, info = env.step(env_state, action)
         done = jnp.logical_or(terminated, truncated)
         total_reward += float(reward)
 
@@ -695,6 +730,35 @@ def _generate_single_final_video(
     # Convert frames to video format
     if len(frames) > 0:
         frames = np.stack(frames, axis=0)
+        if adv_enabled:
+            actions = np.array(mod_actions, dtype=np.int32)
+            active = actions != 0
+            palette = np.array(
+                [
+                    [80, 80, 80],
+                    [230, 57, 70],
+                    [29, 185, 84],
+                    [69, 123, 157],
+                    [255, 183, 3],
+                    [131, 56, 236],
+                    [251, 86, 7],
+                    [0, 180, 216],
+                ],
+                dtype=np.uint8,
+            )
+            colors = palette[actions % len(palette)]
+            frames[:, :4, :, :] = colors[:, None, None, :]
+
+            action_counts = {
+                f"adversary_action_{int(action)}": int(count)
+                for action, count in zip(*np.unique(actions, return_counts=True))
+            }
+            wandb.log(
+                {
+                    f"final_adversary_active_fraction_seed{seed_idx}_{video_label}": float(active.mean()) if len(active) else 0.0,
+                    f"final_adversary_action_counts_seed{seed_idx}_{video_label}": action_counts,
+                }
+            )
         # Shape: (N, H, W, 3) -> (N, 3, H, W) for wandb
         frames = np.transpose(frames, (0, 3, 1, 2))
 
@@ -744,6 +808,18 @@ def generate_final_video(config, params, batch_stats, seed_idx=0, env_step=None)
             video_index,
             env_step=env_step,
         )
+        if config.get("ADV_RANDOM", False) and config.get("LOG_ADVERSARY_VIDEO", False):
+            _generate_single_final_video(
+                config,
+                params,
+                batch_stats,
+                seed_idx,
+                mods_config,
+                f"{video_label}_adversary",
+                video_index + len(video_configs),
+                env_step=env_step,
+                adversary_video=True,
+            )
 
 
 #TODO:

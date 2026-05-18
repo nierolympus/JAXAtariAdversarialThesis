@@ -37,22 +37,10 @@ def render_modified_pong() -> None:
     print("       Float multipliers are preserved (no int truncation).\n")
 
     mod_specs = [
-        GenericModSpec(
-            target="ball_vel_y",
-            op="mul",
-            value=1.5,
-            preserve_sign=True,
-            dtype=jnp.float32,
-        ),
-        GenericModSpec(
-            target="ball_vel_x",
-            op="mul",
-            value=1.5,
-            min_value=-4.0,
-            max_value=4.0,
-            preserve_sign=True,
-            dtype=jnp.float32,
-        ),
+        GenericModSpec(target="ball_vel_x", op="mul", value=2,  preserve_sign=True, dtype=jnp.float32),
+        GenericModSpec(target="ball_vel_x", op="mul", value=0.5,  preserve_sign=True, dtype=jnp.float32),
+        GenericModSpec(target="ball_vel_y", op="mul", value=2, preserve_sign=True, dtype=jnp.float32),
+        GenericModSpec(target="ball_vel_y", op="mul", value=0.5,  preserve_sign=True, dtype=jnp.float32),
     ]
 
     base_env = jaxatari.make("pong")

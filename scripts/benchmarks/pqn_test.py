@@ -155,23 +155,29 @@ def make_test(config):
         env = AtariWrapper(
             env,
             episodic_life=True,
-            frame_skip=4,
-            frame_stack_size=4,
-            sticky_actions=True,
-            max_pooling=True,
-            clip_reward=clip_reward,
-            noop_reset=30,
-            max_episode_length=max_episode_length,
+            sticky_actions=0.25,
+            first_fire=True,
+            noop_max=30,
+            max_frames_per_episode=max_episode_length,
         )
         if config.get("OBJECT_CENTRIC", False):
-            env = ObjectCentricWrapper(env)
+            env = ObjectCentricWrapper(env, frame_skip=4, clip_reward=clip_reward)
             env = FlattenObservationWrapper(env)
         else:
             grayscale = config.get("PIXEL_GRAYSCALE", False)
             do_resize = config.get("PIXEL_RESIZE", True)
             resize_shape = config.get("PIXEL_RESIZE_SHAPE", [84, 84])
             use_native_downscaling = config.get("USE_NATIVE_DOWNSCALING", False)
-            env = PixelObsWrapper(env, do_pixel_resize=do_resize, pixel_resize_shape=resize_shape, grayscale=grayscale, use_native_downscaling=use_native_downscaling)
+            env = PixelObsWrapper(
+                env,
+                do_pixel_resize=do_resize,
+                pixel_resize_shape=resize_shape,
+                grayscale=grayscale,
+                use_native_downscaling=use_native_downscaling,
+                frame_skip=4,
+                max_pooling=True,
+                clip_reward=clip_reward,
+            )
         env = NormalizeObservationWrapper(env)
         env = LogWrapper(env)
         return env
@@ -276,9 +282,10 @@ def make_test(config):
                     action = jax.vmap(eps_greedy_exploration)(
                         jax.random.split(_rng, config["TEST_NUM_ENVS"]), q_vals, eps
                     )
-                    new_obs, new_env_state, reward, done, info = jax.vmap(eval_env.step)(
+                    new_obs, new_env_state, reward, terminated, truncated, info = jax.vmap(eval_env.step)(
                         env_state, action
                     )
+                    done = jnp.logical_or(terminated, truncated)
                     env_state_vid = jax.tree.map(lambda x: x[0], new_env_state)
                     dones_vid = jax.tree.map(lambda x: x[0], done)
                     return (new_env_state, new_obs, rng), (info, env_state_vid, dones_vid)
@@ -352,17 +359,20 @@ def single_run(config):
     alg_name = config.get("ALG_NAME", "pqn")
     env_name = config["ENV_NAME"]
     oc = "oc" if config.get("OBJECT_CENTRIC", False) else "pixel"
+    load_alg_name = config.get("LOAD_ALG_NAME", alg_name)
+    load_env_name = config.get("LOAD_ENV_NAME", env_name)
+    load_oc = config.get("LOAD_OC", oc)
 
     rng = jax.random.PRNGKey(config["SEED"])
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
 
-    save_dir = os.path.join(config["SAVE_PATH"], env_name)
+    save_dir = os.path.join(config["SAVE_PATH"], load_env_name)
     train_state_params = []
     batch_stats = []
     for i, rng in enumerate(rngs):
         save_path = os.path.join(
             save_dir,
-            f'{alg_name}_{env_name}_{oc}_seed{config["SEED"]}_vmap{i}.safetensors',
+            f'{load_alg_name}_{load_env_name}_{load_oc}_seed{config["SEED"]}_vmap{i}.safetensors',
         )
         if not os.path.exists(save_path):
             raise ValueError(f"Save path {save_path} does not exist!")

@@ -1,5 +1,6 @@
 # This is adapted from Atari configuration 
-ALG_NAME: "pqn"
+NAME_INITIALS: "RE"
+ALG_NAME: "pqn_adv_random"
 TOTAL_TIMESTEPS: 2e8 # 1e8 == 100M, but times 4 (frame-skipping) -> pqn paper: enough to outperform Rainbow
 TOTAL_TIMESTEPS_DECAY: 2e8 # will be used for decay functions, in case you want to test for less timesteps and keep decays same
 NUM_ENVS: 8192 #512 # parallel environments
@@ -18,9 +19,14 @@ GAMMA: 0.99
 LAMBDA: 0.65
 
 # env specific
-ENV_NAME: "Pong"
+ENV_NAME: "pong_default"
+LOAD_ENV_NAME: "pong"
+LOAD_ALG_NAME: "pqn_adv_random"
+LOAD_OC: "oc"
 ENV_KWARGS: {}
 OBJECT_CENTRIC: True
+ADV_RANDOM: False
+ADV_WRAPPER: null
 # Mods used during training and evaluation
 # TRAIN_MODS: mods applied during training (set to null for base env training)
 # EVAL_MODS: mods evaluated separately after training
@@ -32,10 +38,10 @@ EVAL_MODS: null
 # Turn off for reported training run.
 TEST_DURING_TRAINING: False
 TEST_INTERVAL: 1.0 # in terms of total updates (1.0 means a single test at the end)
-TEST_NUM_ENVS: 128 #512
+TEST_NUM_ENVS: 1024 #512
 TEST_NUM_STEPS: 10000
 EPS_TEST: 0.0 # 0 for greedy policy
-RECORD_VIDEO: False
+RECORD_VIDEO: True
 
 # Generate a final video at the end of training (includes the mod eval videos)
 RECORD_FINAL_VIDEO: True

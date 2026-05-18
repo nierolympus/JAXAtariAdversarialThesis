@@ -57,6 +57,7 @@ GAME_MODULES = {
     "namethisgame": "jaxatari.games.jax_namethisgame",
     "phoenix": "jaxatari.games.jax_phoenix",
     "pong": "jaxatari.games.jax_pong",
+    "pong_default": "jaxatari.games.jax_pong_default",
     "qbert": "jaxatari.games.jax_qbert",
     "riverraid": "jaxatari.games.jax_riverraid",
     "seaquest": "jaxatari.games.jax_seaquest",

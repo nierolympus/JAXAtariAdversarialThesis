@@ -1363,10 +1363,10 @@ class PongStateModWrapper(GenericStateModWrapper):
     def __init__(self, env):
         # Keep action IDs stable: 1..10 are valid mod actions; 5/6 are no-ops for backward compatibility.
         specs = [
-            GenericModSpec(target="ball_vel_x", op="mul", value=1.1, min_const="MIN_BALL_SPEED", max_const="BALL_MAX_SPEED", preserve_sign=True, dtype=jnp.float32),
-            GenericModSpec(target="ball_vel_x", op="mul", value=0.9, min_const="MIN_BALL_SPEED", max_const="BALL_MAX_SPEED", preserve_sign=True, dtype=jnp.float32),
-            GenericModSpec(target="ball_vel_y", op="mul", value=1.1, min_const="MIN_BALL_SPEED", max_const="BALL_MAX_SPEED", preserve_sign=True, dtype=jnp.float32),
-            GenericModSpec(target="ball_vel_y", op="mul", value=0.9, min_const="MIN_BALL_SPEED", max_const="BALL_MAX_SPEED", preserve_sign=True, dtype=jnp.float32),
+            GenericModSpec(target="ball_vel_y", op="mul", value=2, min_const="MIN_BALL_SPEED", max_const= "MAX_BALL_SPEED", preserve_sign=True, dtype=jnp.float32),
+            GenericModSpec(target="ball_vel_y", op="mul", value=0.5, min_const="MIN_BALL_SPEED", max_const= "MAX_BALL_SPEED", preserve_sign=True, dtype=jnp.float32),
+            GenericModSpec(target="ball_vel_x", op="mul", value=2, min_const="MIN_BALL_SPEED", max_const= "MAX_BALL_SPEED", preserve_sign=True, dtype=jnp.float32),
+            GenericModSpec(target="ball_vel_x", op="mul", value=0.5, min_const="MIN_BALL_SPEED", max_const= "MAX_BALL_SPEED", preserve_sign=True, dtype=jnp.float32),
         ]
 
         super().__init__(

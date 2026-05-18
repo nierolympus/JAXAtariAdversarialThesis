@@ -33,9 +33,9 @@ class PongConstants(struct.PyTreeNode):
     ENEMY_STEP_SIZE: int = struct.field(pytree_node=False, default=2)
     WIDTH: int = struct.field(pytree_node=False, default=160)
     HEIGHT: int = struct.field(pytree_node=False, default=210)
-    BASE_BALL_SPEED: float = struct.field(pytree_node=False, default=1)
-    MAX_BALL_SPEED: float= struct.field(pytree_node=False, default=4)
-    MIN_BALL_SPEED: float= struct.field(pytree_node=False, default=1)
+    BASE_BALL_SPEED: int = struct.field(pytree_node=False, default=1)
+    MAX_BALL_SPEED: int = struct.field(pytree_node=False, default=4)
+    MIN_BALL_SPEED: int = struct.field(pytree_node=False, default=1)
     
     # Colors and coordinates are static
     BACKGROUND_COLOR: Tuple[int, int, int] = struct.field(pytree_node=False, default=(144, 72, 17))
@@ -56,7 +56,7 @@ class PongConstants(struct.PyTreeNode):
     ASSET_CONFIG: tuple = struct.field(pytree_node=False, default_factory=_get_default_asset_config)
 
     # Ball and Player Constants
-    BALL_SPEED: Tuple[float, float] = struct.field(pytree_node=False, default=(-1, 1))
+    BALL_SPEED: Tuple[int, int] = struct.field(pytree_node=False, default=(-1, 1))
     BALL_START_X: int = struct.field(pytree_node=False, default=78)
     BALL_START_Y: int = struct.field(pytree_node=False, default=115)
 
@@ -268,19 +268,19 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
         return state.replace(
             ball_x=ball_x.astype(jnp.int32),
             ball_y=ball_y.astype(jnp.int32),
-            ball_vel_x=ball_vel_x.astype(jnp.float32),
-            ball_vel_y=ball_vel_y.astype(jnp.float32)
+            ball_vel_x=ball_vel_x.astype(jnp.int32),
+            ball_vel_y=ball_vel_y.astype(jnp.int32)
         )
 
     def _enemy_step(self, state: PongState) -> PongState:
         should_move = state.step_counter % 8 != 0
         direction = jnp.sign(state.ball_y - state.enemy_y)
         new_y = state.enemy_y + (direction * self.consts.ENEMY_STEP_SIZE).astype(jnp.int32)
-
+        
         enemy_y = jax.lax.cond(
             should_move, lambda _: new_y, lambda _: state.enemy_y, operand=None
         )
-
+        
         return state.replace(enemy_y=enemy_y.astype(jnp.int32))
 
     def _score_and_reset(self, state: PongState) -> PongState:
@@ -304,8 +304,8 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
         current_values = (
             state.ball_x.astype(jnp.int32),
             state.ball_y.astype(jnp.int32),
-            state.ball_vel_x.astype(jnp.float32),
-            state.ball_vel_y.astype(jnp.float32),
+            state.ball_vel_x.astype(jnp.int32),
+            state.ball_vel_y.astype(jnp.int32),
         )
         ball_x_final, ball_y_final, ball_vel_x_final, ball_vel_y_final = jax.lax.cond(
             ball_reset,
@@ -363,17 +363,17 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
             state.ball_y > self.consts.BALL_START_Y,
             1,
             -1,
-        ).astype(jnp.float32)
+        ).astype(jnp.int32)
 
         ball_vel_x = jnp.where(
             scored_right, 1, -1
-        ).astype(jnp.float32)
+        ).astype(jnp.int32)
 
         return (
             jnp.array(self.consts.BALL_START_X).astype(jnp.int32),
             jnp.array(self.consts.BALL_START_Y).astype(jnp.int32),
-            ball_vel_x,
-            ball_vel_y,
+            ball_vel_x.astype(jnp.int32),
+            ball_vel_y.astype(jnp.int32),
         )
 
     def reset(self, key: chex.PRNGKey = jax.random.PRNGKey(42)) -> Tuple[PongObservation, PongState]:
@@ -386,8 +386,8 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
             ball_y=jnp.array(self.consts.BALL_START_Y).astype(jnp.int32),
             enemy_y=jnp.array(115).astype(jnp.int32),
             enemy_speed=jnp.array(0.0).astype(jnp.int32),
-            ball_vel_x=jnp.array(self.consts.BALL_SPEED[0]).astype(jnp.float32),
-            ball_vel_y=jnp.array(self.consts.BALL_SPEED[1]).astype(jnp.float32),
+            ball_vel_x=jnp.array(self.consts.BALL_SPEED[0]).astype(jnp.int32),
+            ball_vel_y=jnp.array(self.consts.BALL_SPEED[1]).astype(jnp.int32),
             player_score=jnp.array(0).astype(jnp.int32),
             enemy_score=jnp.array(0).astype(jnp.int32),
             step_counter=jnp.array(0).astype(jnp.int32),
