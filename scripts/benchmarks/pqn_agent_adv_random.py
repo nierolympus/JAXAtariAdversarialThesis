@@ -759,6 +759,24 @@ def _generate_single_final_video(
                     f"final_adversary_action_counts_seed{seed_idx}_{video_label}": action_counts,
                 }
             )
+        elif mods_config:
+            palette = np.array(
+                [
+                    [80, 80, 80],
+                    [230, 57, 70],
+                    [29, 185, 84],
+                    [69, 123, 157],
+                    [255, 183, 3],
+                    [131, 56, 236],
+                    [251, 86, 7],
+                    [0, 180, 216],
+                ],
+                dtype=np.uint8,
+            )
+            label_bytes = str(video_label).encode("utf-8")
+            color_index = sum(label_bytes) % len(palette)
+            frames[:, :4, :, :] = palette[color_index][None, None, None, :]
+
         # Shape: (N, H, W, 3) -> (N, 3, H, W) for wandb
         frames = np.transpose(frames, (0, 3, 1, 2))
 
@@ -955,4 +973,3 @@ def main(config):
 
 if __name__ == "__main__":
     main()
-

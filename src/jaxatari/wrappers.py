@@ -1353,7 +1353,287 @@ class GenericStateModWrapper(JaxatariWrapper):
     def step(self, state, action, adversary_action=None):
         base_action, mod_action = self._normalize_step_actions(action, adversary_action)
         return self._step_impl(state, base_action, mod_action)
+"""
+AccelDeltaModWrapper: applies a FIXED SET of mod actions (a "level") EVERY
+step of an episode, where each mod action AMPLIFIES (by a strength factor,
+e.g. 2x) only the CHANGE in its target parameter caused by that step's base
+physics -- not the parameter's absolute value. This is what prevents
+compounding: a parameter that physics didn't touch this step (delta=0)
+is left completely untouched, so there's no "2x2x2..." runaway. Only
+genuine physics-driven changes (e.g. a paddle/wall bounce changing
+ball_vel_x) get amplified, once per occurrence.
 
+Concretely, per active mod action targeting parameter P, per step:
+
+    pre  = P value BEFORE this step's base env.step()
+    post = P value AFTER this step's base env.step()
+    delta = post - pre
+    amplified = pre + delta * strength
+    amplified = clamp(amplified, min_bound, max_bound)   # same bounds as
+                                                          # the original spec
+
+If delta == 0 (no bounce/no change this step), amplified == pre exactly --
+a true no-op for that step, by construction (0 * strength == 0).
+
+This requires a different application ORDER than GenericStateModWrapper:
+GenericStateModWrapper applies its mod BEFORE calling the base env's
+step() (it only ever sees one state snapshot, the pre-step one).
+AccelDeltaModWrapper must call the base env's step() FIRST, then compare
+pre/post snapshots to isolate the delta, then amplify. It is therefore NOT
+a drop-in subclass override of _apply_mod -- it needs its own step()
+implementation built around GenericModSpec metadata (target path, bounds,
+preserve_sign), reusing that dataclass for spec authoring/consistency, but
+not reusing _compile_spec_fn's single-snapshot apply logic.
+
+Level representation: unchanged from accel_level_buffer.py -- a level is a
+frozenset of mod-action indices (1-indexed, 0 reserved for no-op), applied
+as a set. Since this wrapper applies the WHOLE set every step (per your
+clarification), "applying the level" here means: every step, for every
+active index in the level, amplify that spec's delta. The level itself
+does not change within an episode; only which deltas get amplified is
+fixed, while the deltas themselves naturally vary step to step (zero on
+no-bounce steps, nonzero on bounce steps) because they come from the
+live physics, not from a stored value.
+"""
+
+
+import functools
+from typing import Optional, Sequence
+
+import chex
+import jax
+import jax.numpy as jnp
+
+from jaxatari.wrappers import (
+    JaxatariWrapper,
+    GenericModSpec,
+    _unwrap_env_chain,
+    _has_wrapper_in_chain,
+    _get_core_env_state,
+    _set_core_env_state,
+    AtariWrapper,
+)
+
+
+class AccelDeltaModWrapper(JaxatariWrapper):
+    """
+    Wraps an env (same placement requirement as GenericStateModWrapper:
+    must sit on top of a chain that includes AtariWrapper) and, every
+    step, amplifies the physics-caused delta of each active spec's target
+    parameter by `strength`, for whichever specs are active in the
+    current episode's level.
+
+    Unlike GenericStateModWrapper, the "mod action" here is not a single
+    scalar dispatched via lax.switch -- it's a fixed-shape boolean mask
+    (one bool per spec) plus a scalar strength, both supplied per call
+    (and, per your design, held constant for an entire episode by the
+    caller -- this wrapper itself is stateless/memoryless about levels,
+    it just applies whatever mask+strength it's given, every step. The
+    "fixed for the episode" property is enforced by the CALLER passing
+    the same mask/strength every step of that episode, not by this
+    wrapper tracking episode boundaries.)
+    """
+
+    def __init__(
+            self,
+            env,
+            mod_specs: Sequence[GenericModSpec],
+    ):
+        super().__init__(env)
+        self._action_space = self._env.action_space()
+        self._core_env = _unwrap_env_chain(self._env)
+        assert _has_wrapper_in_chain(self._env, AtariWrapper), (
+            "AccelDeltaModWrapper should be the last wrapper on top of a "
+            "chain that includes AtariWrapper"
+        )
+        self._mod_specs = list(mod_specs)
+        self._spec_appliers = [self._compile_delta_spec(s) for s in self._mod_specs]
+
+    def action_space(self):
+        return self._action_space
+
+    # -- path resolution helpers (mirrors GenericStateModWrapper) ----------
+
+    def _resolve_path(self, obj, path_parts):
+        import functools as _functools
+
+        def _getter(inner_obj, key):
+            return inner_obj[key] if isinstance(inner_obj, dict) else getattr(inner_obj, key)
+
+        return _functools.reduce(_getter, path_parts, obj)
+
+    def _set_path(self, obj, path_parts, value):
+        head, *tail = path_parts
+        if not tail:
+            if isinstance(obj, dict):
+                new_obj = obj.copy()
+                new_obj[head] = value
+                return new_obj
+            if hasattr(obj, "replace"):
+                return obj.replace(**{head: value})
+            if hasattr(obj, "_replace"):
+                return obj._replace(**{head: value})
+            raise TypeError(f"Object of type {type(obj)} does not support immutable update.")
+        child = obj[head] if isinstance(obj, dict) else getattr(obj, head)
+        new_child = self._set_path(child, tail, value)
+        if isinstance(obj, dict):
+            new_obj = obj.copy()
+            new_obj[head] = new_child
+            return new_obj
+        if hasattr(obj, "replace"):
+            return obj.replace(**{head: new_child})
+        if hasattr(obj, "_replace"):
+            return obj._replace(**{head: new_child})
+        raise TypeError(f"Object of type {type(obj)} does not support immutable update.")
+
+    def _resolve_const(self, path):
+        return self._resolve_path(self._core_env.consts, tuple(path.split(".")))
+
+    def _resolve_bound(self, literal, const_path):
+        if const_path is not None:
+            return jnp.asarray(self._resolve_const(const_path))
+        if literal is not None:
+            return jnp.asarray(literal)
+        return None
+
+    # -- compiling a delta-amplifying applier per spec ----------------------
+
+    def _compile_delta_spec(self, spec: GenericModSpec):
+        """
+        Builds a function (pre_core_state, post_core_state, strength) ->
+        new_post_core_state that amplifies ONLY the physics-caused delta
+        of spec.target, by `strength`, then clamps to spec's bounds.
+
+        Note: spec.op / spec.value / spec.factor are NOT used here -- this
+        is a deliberate departure from GenericModSpec's normal meaning.
+        For AccelDeltaModWrapper, a GenericModSpec is used purely as a
+        convenient bundle of (target path, bounds, preserve_sign, dtype);
+        the "op"/"value"/"factor" fields that encode an absolute
+        add/sub/mul/set transformation are ignored. If this conflation is
+        confusing, the alternative is a separate lightweight dataclass
+        (e.g. DeltaAmpSpec) with just target/bounds/preserve_sign/dtype --
+        flagging this as a naming/clarity decision, not a correctness one.
+        """
+        target_path = tuple(spec.target.split("."))
+        bound_min = self._resolve_bound(spec.min_value, spec.min_const)
+        bound_max = self._resolve_bound(spec.max_value, spec.max_const)
+        has_min = bound_min is not None
+        has_max = bound_max is not None
+        preserve_sign = spec.preserve_sign and (has_min or has_max)
+        dtype = spec.dtype
+
+        def _apply(pre_core_state, post_core_state, strength):
+            pre_val = self._resolve_path(pre_core_state, target_path)
+            post_val = self._resolve_path(post_core_state, target_path)
+
+            delta = post_val - pre_val
+            amplified = pre_val + delta * strength
+
+            def _clamp_preserve_sign(x):
+                sign = jnp.where(x < 0, -1, 1)
+                magnitude = jnp.abs(x)
+                if has_min and has_max:
+                    magnitude = jnp.clip(magnitude, bound_min, bound_max)
+                elif has_min:
+                    magnitude = jnp.maximum(magnitude, bound_min)
+                elif has_max:
+                    magnitude = jnp.minimum(magnitude, bound_max)
+                return sign * magnitude
+
+            def _clamp_regular(x):
+                if has_min and has_max:
+                    return jnp.clip(x, bound_min, bound_max)
+                if has_min:
+                    return jnp.maximum(x, bound_min)
+                if has_max:
+                    return jnp.minimum(x, bound_max)
+                return x
+
+            clamp_fn = _clamp_preserve_sign if preserve_sign else _clamp_regular
+            amplified = clamp_fn(amplified)
+
+            if dtype is not None:
+                amplified = amplified.astype(dtype)
+
+            return self._set_path(post_core_state, target_path, amplified)
+
+        return _apply
+
+    # -- applying the whole active set, every step --------------------------
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _apply_level_deltas(self, pre_state, post_state, level_mask, strength):
+        """
+        For each active spec index in `level_mask` (bool array, shape
+        (n_specs,), 1:1 with self._mod_specs -- NOT offset by a no-op
+        slot, since every entry here is a real spec), amplify that
+        spec's delta in post_state relative to pre_state, by `strength`.
+        Inactive specs are left untouched. Order: ascending spec index
+        (deterministic, matches level_to_action_sequence's convention --
+        though note indices here are 0-indexed into mod_specs directly,
+        whereas the buffer's convention reserves index 0 for a global
+        no-op; the integration layer is responsible for that off-by-one
+        translation, flagged here so it isn't silently lost).
+        """
+        pre_core = _get_core_env_state(pre_state)
+        post_core = _get_core_env_state(post_state)
+
+        n = len(self._spec_appliers)
+
+        def body(carry_core, i):
+            active = level_mask[i]
+
+            def _apply_i(core):
+                return jax.lax.switch(
+                    i,
+                    self._spec_appliers,
+                    pre_core,
+                    core,
+                    strength,
+                )
+
+            new_core = jax.lax.cond(active, _apply_i, lambda c: c, carry_core)
+            return new_core, None
+
+        final_core, _ = jax.lax.scan(body, post_core, jnp.arange(n))
+        return _set_core_env_state(post_state, final_core)
+
+    # -- public step ---------------------------------------------------------
+
+    def step(self, state, action, level_mask: chex.Array, strength: chex.Array = 1.0):
+        """
+        level_mask: bool array, shape (len(self._mod_specs),). Active
+            entries have their physics-delta amplified this step.
+            Pass jnp.zeros(n_specs, dtype=bool) for "no adversary" steps.
+        strength: scalar (or per-env array under vmap) multiplier on the
+            delta. strength=1.0 reproduces unmodified base-env behaviour
+            for any active spec (delta * 1.0 == delta), so this is a true
+            identity at strength=1, independent of which specs are active.
+
+        Caller (training loop) is responsible for holding level_mask and
+        strength constant across all steps of a given episode -- this
+        wrapper does not track episode boundaries itself, since regret
+        is computed per-level over a whole episode/batch and the level is
+        a host-side decision (see accel_level_buffer.py), not something
+        this wrapper needs to know the lifecycle of.
+        """
+        base_action = jnp.asarray(action, dtype=jnp.int32)
+        obs, post_state, reward, terminated, truncated, info = self._env.step(
+            state, base_action
+        )
+
+        level_mask = jnp.asarray(level_mask, dtype=bool)
+        strength   = jnp.asarray(strength, dtype=jnp.float32)
+
+        modified_state = self._apply_level_deltas(state, post_state, level_mask, strength)
+
+
+        info_dict = dict(info) if not hasattr(info, "_asdict") else dict(info._asdict())
+        info_dict["level_mask"] = level_mask
+        info_dict["strength"]   = strength
+
+
+        return obs, modified_state, reward, terminated, truncated, info_dict
 
 class PongStateModWrapper(GenericStateModWrapper):
     """
@@ -1362,11 +1642,15 @@ class PongStateModWrapper(GenericStateModWrapper):
 
     def __init__(self, env):
         # Keep action IDs stable: 1..10 are valid mod actions; 5/6 are no-ops for backward compatibility.
-        specs = [
+        """specs = [
             GenericModSpec(target="ball_vel_y", op="mul", value=2, min_const="MIN_BALL_SPEED", max_const= "MAX_BALL_SPEED", preserve_sign=True, dtype=jnp.float32),
             GenericModSpec(target="ball_vel_y", op="mul", value=0.5, min_const="MIN_BALL_SPEED", max_const= "MAX_BALL_SPEED", preserve_sign=True, dtype=jnp.float32),
             GenericModSpec(target="ball_vel_x", op="mul", value=2, min_const="MIN_BALL_SPEED", max_const= "MAX_BALL_SPEED", preserve_sign=True, dtype=jnp.float32),
             GenericModSpec(target="ball_vel_x", op="mul", value=0.5, min_const="MIN_BALL_SPEED", max_const= "MAX_BALL_SPEED", preserve_sign=True, dtype=jnp.float32),
+        ]"""
+        specs = [
+            GenericModSpec(target="ball_vel_x", op="mul", value=10,min_const="MIN_BALL_SPEED", max_const= "MAX_BALL_SPEED", preserve_sign=True,dtype=jnp.float32),
+            GenericModSpec(target="ball_vel_y", op="mul", value=1,min_const="MIN_BALL_SPEED", max_const= "MAX_BALL_SPEED", preserve_sign=True,dtype=jnp.float32)
         ]
 
         super().__init__(

@@ -19,19 +19,21 @@ GAMMA: 0.99
 LAMBDA: 0.65
 
 # env specific
-ENV_NAME: "pong_default"
+ADV_RANDOM: True
+ADV_WRAPPER: "pong"
+ENV_NAME: "pong"
 LOAD_ENV_NAME: "pong"
 LOAD_ALG_NAME: "pqn_adv_random"
 LOAD_OC: "oc"
 ENV_KWARGS: {}
 OBJECT_CENTRIC: True
-ADV_RANDOM: False
-ADV_WRAPPER: null
+
+# Optional: set to True if you want adversary overlay in test video
 # Mods used during training and evaluation
 # TRAIN_MODS: mods applied during training (set to null for base env training)
 # EVAL_MODS: mods evaluated separately after training
 TRAIN_MODS: null
-EVAL_MODS: null 
+
 
 # Note: This will massively increase compile and run time!
 # But is useful for debugging (watching the video).
@@ -42,6 +44,7 @@ TEST_NUM_ENVS: 1024 #512
 TEST_NUM_STEPS: 10000
 EPS_TEST: 0.0 # 0 for greedy policy
 RECORD_VIDEO: True
+LOG_ADVERSARY_VIDEO: True
 
 # Generate a final video at the end of training (includes the mod eval videos)
 RECORD_FINAL_VIDEO: True

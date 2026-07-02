@@ -14,7 +14,7 @@ import chex
 import optax
 import flax.linen as nn
 from flax.training.train_state import TrainState
-from jaxatari.wrappers import AtariWrapper, PixelObsWrapper, FlattenObservationWrapper, LogWrapper, ObjectCentricWrapper, NormalizeObservationWrapper
+from jaxatari.wrappers import AtariWrapper, PixelObsWrapper, FlattenObservationWrapper, LogWrapper, ObjectCentricWrapper, NormalizeObservationWrapper, PongStateModWrapper
 import hydra
 from omegaconf import OmegaConf
 
@@ -140,6 +140,16 @@ def make_test(config):
     env = jaxatari.make(config["ENV_NAME"].lower())
     base_renderer = env.renderer
 
+    adv_enabled = bool(config.get("ADV_RANDOM", False))
+    adv_wrapper = config.get("ADV_WRAPPER", None)
+    adv_mode = config.get("ADV_MODE", "per_step")
+    adv_prob = float(config.get("ADV_PROB", 1.0))
+    adv_every_n = int(config.get("ADV_EVERY_N", 1))
+    log_adversary_video = bool(config.get("LOG_ADVERSARY_VIDEO", False))
+    adv_env = None
+    adv_renderer = None
+    mod_action_space_n = 1
+
     raw_eval_mods = config.get("EVAL_MODS", config.get("MOD_NAME", None))
     if raw_eval_mods is None:
         eval_mods = []
@@ -183,6 +193,13 @@ def make_test(config):
         return env
 
     env = apply_wrappers(env)
+
+    if adv_enabled and adv_wrapper and adv_wrapper.lower() == "pong":
+        raw_adv_env = jaxatari.make(config["ENV_NAME"].lower())
+        adv_renderer = raw_adv_env.renderer
+        adv_env = apply_wrappers(raw_adv_env)
+        adv_env = PongStateModWrapper(adv_env)
+        mod_action_space_n = len(adv_env._mod_fns)
 
     # Build one wrapped env per requested eval mod.
     mod_env_entries = []
@@ -263,11 +280,11 @@ def make_test(config):
         rng, _rng = jax.random.split(rng)
         train_state = create_agent(rng)
         
-        def _build_get_test_metrics(eval_env, renderer, is_mod=False, mod_name=None):
+        def _build_get_test_metrics(eval_env, renderer, is_mod=False, mod_name=None, adversary_video=False):
             @jax.jit
             def _get_test_metrics(train_state, rng):
 
-                def _env_step(carry, _):
+                def _env_step(carry, step_idx):
                     env_state, last_obs, rng = carry
                     rng, _rng = jax.random.split(rng)
                     q_vals = network.apply(
@@ -282,9 +299,24 @@ def make_test(config):
                     action = jax.vmap(eps_greedy_exploration)(
                         jax.random.split(_rng, config["TEST_NUM_ENVS"]), q_vals, eps
                     )
-                    new_obs, new_env_state, reward, terminated, truncated, info = jax.vmap(eval_env.step)(
-                        env_state, action
-                    )
+                    if adversary_video:
+                        rng, mod_rng, mask_rng = jax.random.split(rng, 3)
+                        mod_action = jax.random.randint(
+                            mod_rng,
+                            shape=action.shape,
+                            minval=0,
+                            maxval=mod_action_space_n,
+                        )
+                        if adv_mode == "prob":
+                            apply_mask = jax.random.bernoulli(mask_rng, adv_prob, shape=action.shape)
+                            mod_action = jnp.where(apply_mask, mod_action, 0)
+                        elif adv_mode == "every_n":
+                            apply_step = (step_idx % adv_every_n) == 0
+                            mod_action = jnp.where(apply_step, mod_action, 0)
+                        step_out = jax.vmap(eval_env.step)(env_state, action, mod_action)
+                    else:
+                        step_out = jax.vmap(eval_env.step)(env_state, action)
+                    new_obs, new_env_state, reward, terminated, truncated, info = step_out
                     done = jnp.logical_or(terminated, truncated)
                     env_state_vid = jax.tree.map(lambda x: x[0], new_env_state)
                     dones_vid = jax.tree.map(lambda x: x[0], done)
@@ -294,12 +326,14 @@ def make_test(config):
                 reset_keys = jax.random.split(_rng, config["TEST_NUM_ENVS"])
                 init_obs, env_state = jax.vmap(eval_env.reset)(reset_keys)
 
+                step_indices = jnp.arange(config["TEST_NUM_STEPS"], dtype=jnp.int32)
                 _, output = jax.lax.scan(
-                    _env_step, (env_state, init_obs, _rng), None, config["TEST_NUM_STEPS"]
+                    _env_step, (env_state, init_obs, _rng), step_indices
                 )
                 infos, env_states, dones = output[0], output[1], output[2]
 
                 if config.get("RECORD_VIDEO", False):
+                    video_mod_actions = infos.get("mod_action") if adversary_video else None
                     jax.debug.callback(
                         video_callback,
                         env_states,
@@ -308,6 +342,8 @@ def make_test(config):
                         renderer,
                         mod=is_mod,
                         mod_name=mod_name,
+                        mod_actions=video_mod_actions,
+                        adversary_video=adversary_video,
                     )
 
                 # Robust aggregation: if no episode terminates within TEST_NUM_STEPS,
@@ -332,7 +368,11 @@ def make_test(config):
             return _get_test_metrics
 
         get_base_metrics = _build_get_test_metrics(
-            eval_env=env, renderer=base_renderer, is_mod=False, mod_name=None
+            eval_env=adv_env if adv_env is not None else env,
+            renderer=adv_renderer if adv_env is not None else base_renderer,
+            is_mod=False,
+            mod_name=None,
+            adversary_video=adv_env is not None,
         )
         rng, _rng = jax.random.split(rng)
         test_metrics = get_base_metrics(train_state, _rng)
@@ -414,7 +454,8 @@ def single_run(config):
     print(f"Total: {time.time()-t0} seconds.")
     avg_return = outs["test_metrics"]["returned_episode_returns"]
     avg_len = outs["test_metrics"]["returned_episode_lengths"]
-    print(f"Average return of default env: {avg_return}, length: {avg_len}.")
+    env_label = "adversary env" if (config.get("ADV_RANDOM", False) and config.get("ADV_WRAPPER", None)) else "default env"
+    print(f"Average return of {env_label}: {avg_return}, length: {avg_len}.")
     log_payload = {
         "test/returned_episode_returns": float(jnp.mean(avg_return)),
         "test/returned_episode_lengths": float(jnp.mean(avg_len)),
