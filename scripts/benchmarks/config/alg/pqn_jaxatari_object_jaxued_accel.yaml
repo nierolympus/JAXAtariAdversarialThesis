@@ -1,0 +1,103 @@
+# Regular-scale PQN + JAXUED ACCEL training for Pong object observations.
+# This mirrors pqn_jaxatari_object_accel.yaml's production size, but is named
+# explicitly for scripts/benchmarks/jaxatari_accel_plr.py. Keep the *_test
+# config for short API/smoke checks.
+
+NAME_INITIALS: "AC"
+ALG_NAME: "pqn_jaxued_accel"
+JAXUED_ALG: "accel"
+
+# Same regular training scale as the existing object-ACCEL experiment.
+TOTAL_TIMESTEPS: 1e7
+TOTAL_TIMESTEPS_DECAY: 1e7
+NUM_ENVS: 128
+NUM_STEPS: 128
+EPS_START: 1.0
+# Pong is sparse reward; retain exploration for the first quarter of training
+# instead of committing to an initially no-op greedy policy after 10%.
+EPS_FINISH: 0.01
+EPS_DECAY: 0.25
+NUM_EPOCHS: 5
+NUM_MINIBATCHES: 32
+NORM_TYPE: "layer_norm"
+LR: 2.5e-4
+MAX_GRAD_NORM: 10
+LR_LINEAR_DECAY: false
+GAMMA: 0.99
+LAMBDA: 0.65
+
+# Environment and protagonist observations.
+ENV_NAME: "pong"
+ENV_KWARGS: {}
+OBJECT_CENTRIC: true
+ADV_WRAPPER: "pong"
+
+# Discrete parameter-vector ACCEL level. The first seven coordinates select
+# independent multipliers for physics-caused ball/paddle deltas. The final
+# three choose absolute player paddle height, width, and enemy tracking step.
+# This default grid contains 9^7 * 9 * 7 * 4 = 1,205,308,188 exact levels,
+# but local mutation moves only one bin (two with 15% probability). Use the
+# *_mask config to run the previous 66-mask-level experiment unchanged.
+ACCEL_LEVEL_ENCODING: "parameter_vector"
+ACCEL_BUFFER_CAPACITY: 512
+ACCEL_PARAMETER_BASELINE_PROB: 0.15
+ACCEL_MUTATION_MULTI_PARAM_PROB: 0.15
+ACCEL_PARAMETER_DELTA_MULTIPLIERS: [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5]
+ACCEL_PARAMETER_PADDLE_HEIGHTS: [8, 10, 12, 14, 16, 20, 24, 28, 32]
+ACCEL_PARAMETER_PADDLE_WIDTHS: [2, 3, 4, 5, 6, 7, 8]
+ACCEL_PARAMETER_ENEMY_STEP_SIZES: [1, 2, 3, 4]
+# Retained only for mask compatibility; parameter-vector mode ignores these.
+ACCEL_MAX_LEVEL_SIZE: 2
+ACCEL_STRENGTH: 2.0
+# The core game and trajectory amplifier share a realistic four-pixel/raw-step
+# ball-speed ceiling. Set this to 5 only if intentionally testing faster Pong.
+ACCEL_MAX_BALL_TRAJECTORY_STEP: 4.0
+# Retained for the legacy mask encoding. Parameter-vector mode uses the exact
+# absolute sizes listed above, including normal 16 px.
+ACCEL_PLAYER_PADDLE_HEIGHT_MULTIPLIER: 1.75
+ACCEL_PLAYER_PADDLE_SHRINK_MULTIPLIER: 0.5
+ACCEL_PLAYER_PADDLE_WIDTH_MULTIPLIER: 1.5
+ACCEL_ENEMY_STEP_MULTIPLIER: 2.0
+
+# JAXUED LevelSampler / Maze-PLR ACCEL schedule.
+REPLAY_PROB: 0.8
+STALENESS_COEFF: 0.3
+MINIMUM_FILL_RATIO: 0.10
+PRIORITIZATION: "rank"
+TEMPERATURE: 0.3
+TOPK_K: 4
+BUFFER_DUPLICATE_CHECK: true
+JAXUED_SCORE_FUNCTION: "q_pvl_all_steps"
+JAXUED_INCOMPLETE_SCORE: 0.0
+# Match the original local ACCEL training behavior: learn from DR, replay, and
+# mutation rollouts. Keeping this false trains on only replay rounds.
+EXPLORATORY_GRAD_UPDATES: true
+
+# Periodic robustness evaluation with base and lazy_enemy videos.
+EVAL_DURING_TRAINING: true
+EVAL_EVERY_STEPS: 1000000
+# Always evaluate the final trained protagonist and upload final/base and
+# final/mod_* videos in addition to each periodic eval_* snapshot.
+FINAL_EVAL: true
+EVAL_NUM_ENVS: 128
+EVAL_NUM_STEPS: 10000
+EVAL_MODS: ["lazy_enemy"]
+EVAL_RECORD_VIDEO: true
+EVAL_VIDEO_BASE: true
+EVAL_VIDEO_MODS: true
+EVAL_VIDEO_MAX_STEPS: 1000
+EVAL_VIDEO_FPS: 30
+
+# Five independent snapshots of the current ACCEL-adapted environment.
+TRAIN_RECORD_ACCEL_VIDEO: true
+TRAIN_ACCEL_VIDEO_COUNT: 5
+TRAIN_ACCEL_VIDEO_MAX_STEPS: 1000
+# Visible, in-frame ACCEL level legend above the Pong court (0 disables it).
+ACCEL_VIDEO_OVERLAY_HEIGHT: 24
+
+HYP_TUNE: false
+ENTITY: null
+PROJECT: "Thesis"
+WANDB_MODE: "online"
+SEED: 42
+NUM_SEEDS: 1

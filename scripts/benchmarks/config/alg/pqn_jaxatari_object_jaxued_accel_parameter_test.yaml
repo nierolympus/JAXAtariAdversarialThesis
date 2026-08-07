@@ -1,0 +1,11 @@
+# Fast parameter-vector smoke test. The original *_test config remains the
+# legacy Boolean-mask test for backwards-compatible comparisons.
+defaults:
+  - pqn_jaxatari_object_jaxued_accel_test
+  - _self_
+
+ALG_NAME: "pqn_jaxued_accel_parameter_test"
+ACCEL_LEVEL_ENCODING: "parameter_vector"
+ACCEL_BUFFER_CAPACITY: 16
+ACCEL_PARAMETER_BASELINE_PROB: 0.20
+ACCEL_MUTATION_MULTI_PARAM_PROB: 0.15

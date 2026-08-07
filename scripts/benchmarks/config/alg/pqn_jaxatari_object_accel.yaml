@@ -33,8 +33,46 @@ ACCEL_MAX_LEVEL_SIZE: 2
 ACCEL_SEED_LEVELS: 4
 ACCEL_SAMPLE_TEMPERATURE: 1.0
 ACCEL_STRENGTH: 2.0
+# Third mask bit in jaxatari_accel_plr.py: a real player-paddle morphology
+# action. It multiplies the baseline 16px height, clamps it to 8..32px, and
+# changes both the renderer and collision hitbox before each Pong step.
+ACCEL_PLAYER_PADDLE_HEIGHT_MULTIPLIER: 1.75
 ACCEL_CONFLICT_GROUPS: null
 ACCEL_REPLACEMENT_MARGIN: 0.0
+
+# JAXUED LevelSampler / Maze-PLR-style runner options for jaxatari_accel_plr.py
+JAXUED_ALG: "accel"  # "accel" = new/replay/mutate, "plr" = new/replay
+REPLAY_PROB: 0.8
+STALENESS_COEFF: 0.3
+MINIMUM_FILL_RATIO: 0.5
+PRIORITIZATION: "rank"
+TEMPERATURE: 0.3
+TOPK_K: 4
+BUFFER_DUPLICATE_CHECK: true
+JAXUED_SCORE_FUNCTION: "q_pvl_all_steps"  # "pvl" and "max_mc" call jaxued.utils directly
+JAXUED_INCOMPLETE_SCORE: 0.0
+EXPLORATORY_GRAD_UPDATES: false
+
+# Periodic in-training evaluation for jaxatari_accel_plr.py
+EVAL_DURING_TRAINING: false
+EVAL_EVERY_STEPS: 1000000
+EVAL_NUM_ENVS: 128
+EVAL_NUM_STEPS: 10000
+EVAL_MODS: ["lazy_enemy"]
+# Evaluation clips are independent of ACCEL-training clips. Select the base
+# environment, the configured EVAL_MODS environments, or both.
+EVAL_RECORD_VIDEO: false
+EVAL_VIDEO_BASE: true
+EVAL_VIDEO_MODS: true
+EVAL_VIDEO_MAX_STEPS: 1000
+EVAL_VIDEO_FPS: 30
+
+# Five evenly spaced clips from the actual ACCEL training environment. They
+# use the latest training mask, with a top strip per mask bit
+# (grey=inactive, coloured=active), and do not depend on evaluation being on.
+TRAIN_RECORD_ACCEL_VIDEO: false
+TRAIN_ACCEL_VIDEO_COUNT: 5
+TRAIN_ACCEL_VIDEO_MAX_STEPS: 1000
 
 TEST_DURING_TRAINING: False
 TEST_INTERVAL: 0.1

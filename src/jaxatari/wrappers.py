@@ -1066,6 +1066,36 @@ class GenericModSpec:
     min_const: Optional[str] = struct.field(pytree_node=False, default=None)
     max_const: Optional[str] = struct.field(pytree_node=False, default=None)
     preserve_sign: bool = struct.field(pytree_node=False, default=False)
+    # ACCEL-only safeguard: cap an amplified per-step state change.  Deltas
+    # larger than this are treated as discontinuities (for example a Pong
+    # point reset) and are left untouched.
+    max_abs_delta: Optional[float] = struct.field(pytree_node=False, default=None)
+    dtype: Any = struct.field(pytree_node=False, default=jnp.int32)
+
+
+@struct.dataclass
+class LevelStateModSpec:
+    """A non-compounding pre-step state modification for a level-mask bit.
+
+    Unlike ``GenericModSpec``, the operation is always applied to a named
+    baseline constant rather than the previous state value. This makes a
+    persistent mask safe for geometry/morphology changes: an active ``mul``
+    bit produces ``baseline * value`` on every step, rather than repeatedly
+    multiplying an already modified value.
+    """
+
+    target: str = struct.field(pytree_node=False)
+    baseline_const: str = struct.field(pytree_node=False)
+    # Optional human-readable identifier for metrics/video legends when two
+    # actions intentionally modify the same state target in opposite ways.
+    label: Optional[str] = struct.field(pytree_node=False, default=None)
+    op: str = struct.field(pytree_node=False, default="set")  # add|sub|mul|set
+    value: float = struct.field(pytree_node=False, default=0.0)
+    factor: float = struct.field(pytree_node=False, default=1.0)
+    min_value: Optional[float] = struct.field(pytree_node=False, default=None)
+    max_value: Optional[float] = struct.field(pytree_node=False, default=None)
+    min_const: Optional[str] = struct.field(pytree_node=False, default=None)
+    max_const: Optional[str] = struct.field(pytree_node=False, default=None)
     dtype: Any = struct.field(pytree_node=False, default=jnp.int32)
 
 
@@ -1438,6 +1468,9 @@ class AccelDeltaModWrapper(JaxatariWrapper):
             self,
             env,
             mod_specs: Sequence[GenericModSpec],
+            pre_step_specs: Sequence[LevelStateModSpec] = (),
+            level_encoding: str = "mask",
+            parameter_values: Optional[Sequence[Sequence[float]]] = None,
     ):
         super().__init__(env)
         self._action_space = self._env.action_space()
@@ -1446,11 +1479,89 @@ class AccelDeltaModWrapper(JaxatariWrapper):
             "AccelDeltaModWrapper should be the last wrapper on top of a "
             "chain that includes AtariWrapper"
         )
-        self._mod_specs = list(mod_specs)
-        self._spec_appliers = [self._compile_delta_spec(s) for s in self._mod_specs]
+        self._delta_specs = list(mod_specs)
+        self._pre_step_specs = list(pre_step_specs)
+        # The LevelSampler sees one mask bit per spec. Delta specs occupy the
+        # prefix; morphology/state specs occupy the suffix.
+        self._mod_specs = self._delta_specs + self._pre_step_specs
+        self._spec_appliers = [self._compile_delta_spec(s) for s in self._delta_specs]
+        self._pre_step_appliers = [
+            self._compile_pre_step_spec(s) for s in self._pre_step_specs
+        ]
+        self._level_encoding = str(level_encoding).lower()
+        if self._level_encoding not in {"mask", "parameter_vector"}:
+            raise ValueError(
+                "level_encoding must be 'mask' or 'parameter_vector', got "
+                f"{level_encoding!r}"
+            )
+        self._parameter_values = ()
+        self._parameter_bin_counts = jnp.zeros((0,), dtype=jnp.int32)
+        self._parameter_baseline_level = jnp.zeros((0,), dtype=jnp.int32)
+        self._pre_step_value_setters = [
+            self._compile_pre_step_value_setter(s) for s in self._pre_step_specs
+        ]
+        if self._level_encoding == "parameter_vector":
+            if parameter_values is None or len(parameter_values) != len(self._mod_specs):
+                raise ValueError(
+                    "parameter_vector levels need one non-empty bin-value sequence "
+                    "for every delta and pre-step spec."
+                )
+            self._parameter_values = tuple(
+                jnp.asarray(values, dtype=jnp.float32) for values in parameter_values
+            )
+            if any(values.size == 0 for values in self._parameter_values):
+                raise ValueError("Each parameter-vector dimension needs at least one bin.")
+            self._parameter_bin_counts = jnp.asarray(
+                [values.size for values in self._parameter_values], dtype=jnp.int32
+            )
+            # Delta dimensions are neutral at multiplier 1. Geometry and AI
+            # dimensions are neutral at their raw Pong baseline constants.
+            baseline_values = [1.0] * len(self._delta_specs) + [
+                float(self._resolve_const(spec.baseline_const))
+                for spec in self._pre_step_specs
+            ]
+            self._parameter_baseline_level = jnp.asarray(
+                [
+                    int(np.argmin(np.abs(np.asarray(values) - baseline)))
+                    for values, baseline in zip(self._parameter_values, baseline_values)
+                ],
+                dtype=jnp.int32,
+            )
 
     def action_space(self):
         return self._action_space
+
+    @property
+    def parameter_bin_counts(self):
+        """Number of discrete bins per parameter-vector dimension."""
+        return self._parameter_bin_counts
+
+    @property
+    def parameter_baseline_level(self):
+        """Integer level vector whose decoded values reproduce base Pong."""
+        return self._parameter_baseline_level
+
+    def decode_parameter_level(self, level):
+        """Decode one integer level vector into physical per-spec values.
+
+        Delta-spec dimensions decode to independent delta multipliers.  The
+        pre-step dimensions decode to absolute state values such as paddle
+        height.  Keeping the stored representation integer-valued lets
+        JAXUED's duplicate-aware LevelSampler replay exact levels reliably.
+        """
+        if self._level_encoding != "parameter_vector":
+            raise ValueError("decode_parameter_level is only valid in parameter_vector mode")
+        level = jnp.asarray(level, dtype=jnp.int32)
+        return jnp.stack(
+            [
+                values[jnp.clip(level[i], 0, values.shape[0] - 1)]
+                for i, values in enumerate(self._parameter_values)
+            ]
+        )
+
+    def decode_parameter_levels(self, levels):
+        """Vectorized form of :meth:`decode_parameter_level`."""
+        return jax.vmap(self.decode_parameter_level)(levels)
 
     # -- path resolution helpers (mirrors GenericStateModWrapper) ----------
 
@@ -1520,6 +1631,9 @@ class AccelDeltaModWrapper(JaxatariWrapper):
         has_min = bound_min is not None
         has_max = bound_max is not None
         preserve_sign = spec.preserve_sign and (has_min or has_max)
+        max_abs_delta = (
+            None if spec.max_abs_delta is None else jnp.asarray(spec.max_abs_delta)
+        )
         dtype = spec.dtype
 
         def _apply(pre_core_state, post_core_state, strength):
@@ -1527,7 +1641,17 @@ class AccelDeltaModWrapper(JaxatariWrapper):
             post_val = self._resolve_path(post_core_state, target_path)
 
             delta = post_val - pre_val
-            amplified = pre_val + delta * strength
+            amplified_delta = delta * strength
+            if max_abs_delta is not None:
+                # Do not turn a game reset (e.g. ball x=157 -> x=78 after a
+                # point) into an artificial movement.  Ordinary motion is
+                # accelerated but remains within the caller's physical bound.
+                amplified_delta = jnp.where(
+                    jnp.abs(delta) <= max_abs_delta,
+                    jnp.clip(amplified_delta, -max_abs_delta, max_abs_delta),
+                    delta,
+                )
+            amplified = pre_val + amplified_delta
 
             def _clamp_preserve_sign(x):
                 sign = jnp.where(x < 0, -1, 1)
@@ -1559,6 +1683,132 @@ class AccelDeltaModWrapper(JaxatariWrapper):
 
         return _apply
 
+    def _compile_pre_step_spec(self, spec: LevelStateModSpec):
+        """Compile a mask-controlled state operation derived from a baseline.
+
+        This is intentionally distinct from delta acceleration. Geometry has
+        no useful physics delta to amplify and must be present before the base
+        environment performs collision detection and renders observations.
+        """
+        target_path = tuple(spec.target.split("."))
+        baseline = jnp.asarray(self._resolve_const(spec.baseline_const))
+        amount = jnp.asarray(spec.value * spec.factor)
+        bound_min = self._resolve_bound(spec.min_value, spec.min_const)
+        bound_max = self._resolve_bound(spec.max_value, spec.max_const)
+        op_to_idx = {
+            "add": 0,
+            "increase": 0,
+            "sub": 1,
+            "decrease": 1,
+            "mul": 2,
+            "scale": 2,
+            "set": 3,
+        }
+        op_idx = op_to_idx.get(spec.op.lower(), -1)
+        if op_idx < 0:
+            raise ValueError(f"Unsupported op '{spec.op}' in LevelStateModSpec")
+
+        def _apply(core_state):
+            value = jax.lax.switch(
+                op_idx,
+                (
+                    lambda _: baseline + amount,
+                    lambda _: baseline - amount,
+                    lambda _: baseline * amount,
+                    lambda _: amount,
+                ),
+                operand=None,
+            )
+            if bound_min is not None and bound_max is not None:
+                value = jnp.clip(value, bound_min, bound_max)
+            elif bound_min is not None:
+                value = jnp.maximum(value, bound_min)
+            elif bound_max is not None:
+                value = jnp.minimum(value, bound_max)
+            if spec.dtype is not None:
+                value = value.astype(spec.dtype)
+            return self._set_path(core_state, target_path, value)
+
+        return _apply
+
+    def _compile_pre_step_value_setter(self, spec: LevelStateModSpec):
+        """Compile an absolute, bounded setter for parameter-vector levels."""
+        target_path = tuple(spec.target.split("."))
+        bound_min = self._resolve_bound(spec.min_value, spec.min_const)
+        bound_max = self._resolve_bound(spec.max_value, spec.max_const)
+
+        def _apply(core_state, value):
+            if bound_min is not None and bound_max is not None:
+                value = jnp.clip(value, bound_min, bound_max)
+            elif bound_min is not None:
+                value = jnp.maximum(value, bound_min)
+            elif bound_max is not None:
+                value = jnp.minimum(value, bound_max)
+            if spec.dtype is not None:
+                value = value.astype(spec.dtype)
+            return self._set_path(core_state, target_path, value)
+
+        return _apply
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _apply_pre_step_mods(self, state, level_mask):
+        """Apply active non-compounding state specs before base physics."""
+        if not self._pre_step_appliers:
+            return state
+
+        core_state = _get_core_env_state(state)
+        # Reset every morphology target to its declared baseline before
+        # applying this step's active mask. This makes an inactive bit restore
+        # the base geometry instead of leaving a prior level's value behind.
+        for spec in self._pre_step_specs:
+            core_state = self._set_path(
+                core_state,
+                tuple(spec.target.split(".")),
+                jnp.asarray(self._resolve_const(spec.baseline_const), dtype=spec.dtype),
+            )
+        delta_spec_count = len(self._delta_specs)
+
+        def body(carry_core, i):
+            active = level_mask[delta_spec_count + i]
+            updated_core = jax.lax.cond(
+                active,
+                lambda core: jax.lax.switch(i, self._pre_step_appliers, core),
+                lambda core: core,
+                carry_core,
+            )
+            return updated_core, None
+
+        modified_core, _ = jax.lax.scan(
+            body,
+            core_state,
+            jnp.arange(len(self._pre_step_appliers)),
+        )
+        return _set_core_env_state(state, modified_core)
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _apply_pre_step_parameters(self, state, parameter_values):
+        """Apply decoded absolute geometry/AI values before raw physics."""
+        if not self._pre_step_value_setters:
+            return state
+
+        core_state = _get_core_env_state(state)
+        delta_spec_count = len(self._delta_specs)
+
+        def body(carry_core, i):
+            return jax.lax.switch(
+                i,
+                self._pre_step_value_setters,
+                carry_core,
+                parameter_values[delta_spec_count + i],
+            ), None
+
+        modified_core, _ = jax.lax.scan(
+            body,
+            core_state,
+            jnp.arange(len(self._pre_step_value_setters)),
+        )
+        return _set_core_env_state(state, modified_core)
+
     # -- applying the whole active set, every step --------------------------
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -1575,6 +1825,9 @@ class AccelDeltaModWrapper(JaxatariWrapper):
         no-op; the integration layer is responsible for that off-by-one
         translation, flagged here so it isn't silently lost).
         """
+        if not self._spec_appliers:
+            return post_state
+
         pre_core = _get_core_env_state(pre_state)
         post_core = _get_core_env_state(post_state)
 
@@ -1598,6 +1851,29 @@ class AccelDeltaModWrapper(JaxatariWrapper):
         final_core, _ = jax.lax.scan(body, post_core, jnp.arange(n))
         return _set_core_env_state(post_state, final_core)
 
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _apply_parameter_deltas(self, pre_state, post_state, parameter_values):
+        """Apply all delta specs using their independently decoded multipliers."""
+        if not self._spec_appliers:
+            return post_state
+
+        pre_core = _get_core_env_state(pre_state)
+        post_core = _get_core_env_state(post_state)
+
+        def body(carry_core, i):
+            return jax.lax.switch(
+                i,
+                self._spec_appliers,
+                pre_core,
+                carry_core,
+                parameter_values[i],
+            ), None
+
+        final_core, _ = jax.lax.scan(
+            body, post_core, jnp.arange(len(self._spec_appliers))
+        )
+        return _set_core_env_state(post_state, final_core)
+
     # -- public step ---------------------------------------------------------
 
     def step(self, state, action, level_mask: chex.Array, strength: chex.Array = 1.0):
@@ -1618,19 +1894,45 @@ class AccelDeltaModWrapper(JaxatariWrapper):
         this wrapper needs to know the lifecycle of.
         """
         base_action = jnp.asarray(action, dtype=jnp.int32)
+        strength = jnp.asarray(strength, dtype=jnp.float32)
+        if self._level_encoding == "parameter_vector":
+            level_vector = jnp.asarray(level_mask, dtype=jnp.int32)
+            parameter_values = self.decode_parameter_level(level_vector)
+            pre_step_state = self._apply_pre_step_parameters(state, parameter_values)
+        else:
+            level_mask = jnp.asarray(level_mask, dtype=bool)
+            pre_step_state = self._apply_pre_step_mods(state, level_mask)
         obs, post_state, reward, terminated, truncated, info = self._env.step(
-            state, base_action
+            pre_step_state, base_action
         )
 
-        level_mask = jnp.asarray(level_mask, dtype=bool)
-        strength   = jnp.asarray(strength, dtype=jnp.float32)
-
-        modified_state = self._apply_level_deltas(state, post_state, level_mask, strength)
+        if self._level_encoding == "parameter_vector":
+            modified_state = self._apply_parameter_deltas(
+                pre_step_state, post_state, parameter_values
+            )
+        else:
+            modified_state = self._apply_level_deltas(
+                pre_step_state,
+                post_state,
+                level_mask,
+                strength,
+            )
 
 
         info_dict = dict(info) if not hasattr(info, "_asdict") else dict(info._asdict())
-        info_dict["level_mask"] = level_mask
-        info_dict["strength"]   = strength
+        if self._level_encoding == "parameter_vector":
+            info_dict["level_parameters"] = level_vector
+            info_dict["parameter_values"] = parameter_values
+        else:
+            info_dict["level_mask"] = level_mask
+            info_dict["strength"] = strength
+        if self._pre_step_specs:
+            core_state = _get_core_env_state(modified_state)
+            for spec in self._pre_step_specs:
+                info_dict[f"morphology/{spec.target}"] = self._resolve_path(
+                    core_state,
+                    tuple(spec.target.split(".")),
+                )
 
 
         return obs, modified_state, reward, terminated, truncated, info_dict

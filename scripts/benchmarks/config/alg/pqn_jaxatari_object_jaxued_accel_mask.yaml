@@ -1,0 +1,13 @@
+# Legacy Boolean-mask variant of pqn_jaxatari_object_jaxued_accel.yaml.
+# It preserves the original fixed-action search space for direct comparison
+# with the parameter-vector ACCEL experiment.
+defaults:
+  - pqn_jaxatari_object_jaxued_accel
+  - _self_
+
+ALG_NAME: "pqn_jaxued_accel_mask"
+ACCEL_LEVEL_ENCODING: "mask"
+ACCEL_BUFFER_CAPACITY: 66
+ACCEL_MAX_LEVEL_SIZE: 2
+ACCEL_STRENGTH: 2.0
+MINIMUM_FILL_RATIO: 0.5

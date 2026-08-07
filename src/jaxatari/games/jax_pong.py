@@ -65,15 +65,26 @@ class PongConstants(struct.PyTreeNode):
     PADDLE_MIN_Y: float = struct.field(pytree_node=False, default=24.0)
     PADDLE_MAX_Y: float = struct.field(pytree_node=False, default=190.0)
     PADDLE_DAMPENING_Y: float = struct.field(pytree_node=False, default=170.0)
+    PLAYER_PADDLE_BASE_HEIGHT: int = struct.field(pytree_node=False, default=16)
+    PLAYER_PADDLE_MIN_HEIGHT: int = struct.field(pytree_node=False, default=8)
+    PLAYER_PADDLE_MAX_HEIGHT: int = struct.field(pytree_node=False, default=32)
+    PLAYER_PADDLE_BASE_WIDTH: int = struct.field(pytree_node=False, default=4)
+    PLAYER_PADDLE_MIN_WIDTH: int = struct.field(pytree_node=False, default=2)
+    PLAYER_PADDLE_MAX_WIDTH: int = struct.field(pytree_node=False, default=8)
+    ENEMY_STEP_MIN_SIZE: int = struct.field(pytree_node=False, default=1)
+    ENEMY_STEP_MAX_SIZE: int = struct.field(pytree_node=False, default=4)
 
 
 class PongState(struct.PyTreeNode):
     player_y: chex.Array
     player_speed: chex.Array
+    player_paddle_height: chex.Array
+    player_paddle_width: chex.Array
     ball_x: chex.Array
     ball_y: chex.Array
     enemy_y: chex.Array
     enemy_speed: chex.Array
+    enemy_step_size: chex.Array
     ball_vel_x: chex.Array
     ball_vel_y: chex.Array
     player_score: chex.Array
@@ -106,6 +117,17 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
         super().__init__(consts)
         self.renderer = PongRenderer(self.consts)
 
+    def _player_max_y(self, paddle_height: chex.Array) -> chex.Array:
+        """Keep a resized paddle inside the baseline movement envelope."""
+        return jnp.asarray(self.consts.PADDLE_MAX_Y) - (
+            paddle_height - self.consts.PLAYER_PADDLE_BASE_HEIGHT
+        )
+
+    def _player_dampening_y(self, paddle_height: chex.Array) -> chex.Array:
+        return jnp.asarray(self.consts.PADDLE_DAMPENING_Y) - (
+            paddle_height - self.consts.PLAYER_PADDLE_BASE_HEIGHT
+        )
+
     def _player_step(self, state: PongState, action: chex.Array) -> PongState:
         up = jnp.logical_or(action == Action.RIGHT, action == Action.RIGHTFIRE)
         down = jnp.logical_or(action == Action.LEFT, action == Action.LEFTFIRE)
@@ -130,8 +152,14 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
         # 3. Bottom Dampening (The "Squishy Wall" Asymptote)
         # Uses 0.25 to match the ALE deceleration curve
         applied_dy = jnp.where(
-            jnp.logical_and(state.player_y >= self.consts.PADDLE_DAMPENING_Y, new_speed > 0),
-            jnp.minimum(new_speed, (self.consts.PADDLE_MAX_Y - state.player_y) * 0.25),
+            jnp.logical_and(
+                state.player_y >= self._player_dampening_y(state.player_paddle_height),
+                new_speed > 0,
+            ),
+            jnp.minimum(
+                new_speed,
+                (self._player_max_y(state.player_paddle_height) - state.player_y) * 0.25,
+            ),
             new_speed,
         )
 
@@ -139,7 +167,7 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
         new_y = jnp.clip(
             state.player_y + applied_dy,
             self.consts.PADDLE_MIN_Y,
-            self.consts.PADDLE_MAX_Y,
+            self._player_max_y(state.player_paddle_height),
         )
 
         return state.replace(
@@ -158,7 +186,7 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
         ball_vel_y = jnp.where(wall_bounce, -state.ball_vel_y, state.ball_vel_y)
 
         player_paddle_hit = jnp.logical_and(
-            jnp.logical_and(self.consts.PLAYER_X <= ball_x, ball_x <= self.consts.PLAYER_X + self.consts.PLAYER_SIZE[0]),
+            jnp.logical_and(self.consts.PLAYER_X <= ball_x, ball_x <= self.consts.PLAYER_X + state.player_paddle_width),
             state.ball_vel_x > 0,
         )
 
@@ -166,7 +194,7 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
             player_paddle_hit,
             jnp.logical_and(
                 state.player_y - self.consts.BALL_SIZE[1] <= ball_y,
-                ball_y <= state.player_y + self.consts.PLAYER_SIZE[1] + self.consts.BALL_SIZE[1],
+                ball_y <= state.player_y + state.player_paddle_height + self.consts.BALL_SIZE[1],
             ),
         )
 
@@ -185,23 +213,24 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
 
         paddle_hit = jnp.logical_or(player_paddle_hit, enemy_paddle_hit)
 
-        section_height = self.consts.PLAYER_SIZE[1] / 5
+        player_section_height = state.player_paddle_height / 5
+        enemy_section_height = self.consts.ENEMY_SIZE[1] / 5
 
         hit_position = jnp.where(
             paddle_hit,
             jnp.where(
                 player_paddle_hit,
                 jnp.where(
-                    ball_y < state.player_y + section_height,
+                    ball_y < state.player_y + player_section_height,
                     -2.0,
                     jnp.where(
-                        ball_y < state.player_y + 2 * section_height,
+                        ball_y < state.player_y + 2 * player_section_height,
                         -1.0,
                         jnp.where(
-                            ball_y < state.player_y + 3 * section_height,
+                            ball_y < state.player_y + 3 * player_section_height,
                             0.0,
                             jnp.where(
-                                ball_y < state.player_y + 4 * section_height,
+                                ball_y < state.player_y + 4 * player_section_height,
                                 1.0,
                                 2.0,
                             ),
@@ -209,16 +238,16 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
                     ),
                 ),
                 jnp.where(
-                    ball_y < state.enemy_y + section_height,
+                    ball_y < state.enemy_y + enemy_section_height,
                     -2.0,
                     jnp.where(
-                        ball_y < state.enemy_y + 2 * section_height,
+                        ball_y < state.enemy_y + 2 * enemy_section_height,
                         -1.0,
                         jnp.where(
-                            ball_y < state.enemy_y + 3 * section_height,
+                            ball_y < state.enemy_y + 3 * enemy_section_height,
                             0.0,
                             jnp.where(
-                                ball_y < state.enemy_y + 4 * section_height,
+                                ball_y < state.enemy_y + 4 * enemy_section_height,
                                 1.0,
                                 2.0,
                             ),
@@ -264,6 +293,19 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
             -ball_vel_x,
             ball_vel_x,
         )
+        # The reference Pong constants define a maximum ball speed of four.
+        # Clamp the core dynamics as well as the ACCEL wrapper so a sequence
+        # of boosted paddle hits cannot silently exceed that physical limit.
+        ball_vel_x = jnp.clip(
+            ball_vel_x,
+            -self.consts.MAX_BALL_SPEED,
+            self.consts.MAX_BALL_SPEED,
+        )
+        ball_vel_y = jnp.clip(
+            ball_vel_y,
+            -self.consts.MAX_BALL_SPEED,
+            self.consts.MAX_BALL_SPEED,
+        )
 
         return state.replace(
             ball_x=ball_x.astype(jnp.int32),
@@ -275,7 +317,7 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
     def _enemy_step(self, state: PongState) -> PongState:
         should_move = state.step_counter % 8 != 0
         direction = jnp.sign(state.ball_y - state.enemy_y)
-        new_y = state.enemy_y + (direction * self.consts.ENEMY_STEP_SIZE).astype(jnp.int32)
+        new_y = state.enemy_y + (direction * state.enemy_step_size).astype(jnp.int32)
 
         enemy_y = jax.lax.cond(
             should_move, lambda _: new_y, lambda _: state.enemy_y, operand=None
@@ -382,10 +424,19 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
         state = PongState(
             player_y=jnp.array(96.0, dtype=jnp.float32),
             player_speed=jnp.array(0.0, dtype=jnp.float32),
+            player_paddle_height=jnp.array(
+                self.consts.PLAYER_PADDLE_BASE_HEIGHT,
+                dtype=jnp.int32,
+            ),
+            player_paddle_width=jnp.array(
+                self.consts.PLAYER_PADDLE_BASE_WIDTH,
+                dtype=jnp.int32,
+            ),
             ball_x=jnp.array(self.consts.BALL_START_X).astype(jnp.int32),
             ball_y=jnp.array(self.consts.BALL_START_Y).astype(jnp.int32),
             enemy_y=jnp.array(115).astype(jnp.int32),
             enemy_speed=jnp.array(0.0).astype(jnp.int32),
+            enemy_step_size=jnp.array(self.consts.ENEMY_STEP_SIZE).astype(jnp.int32),
             ball_vel_x=jnp.array(self.consts.BALL_SPEED[0]).astype(jnp.float32),
             ball_vel_y=jnp.array(self.consts.BALL_SPEED[1]).astype(jnp.float32),
             player_score=jnp.array(0).astype(jnp.int32),
@@ -427,8 +478,8 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
         player = ObjectObservation.create(
             x=jnp.array(self.consts.PLAYER_X),
             y=state.player_y,
-            width=jnp.array(self.consts.PLAYER_SIZE[0]),
-            height=jnp.array(self.consts.PLAYER_SIZE[1]),
+            width=state.player_paddle_width,
+            height=state.player_paddle_height,
         )
         
         enemy = ObjectObservation.create(
@@ -534,12 +585,18 @@ class PongRenderer(JAXGameRenderer):
     def render(self, state):
         raster = self.jr.create_object_raster(self.BACKGROUND)
 
-        player_mask = self.SHAPE_MASKS["player"]
-        raster = self.jr.render_at(
+        player_color_id = self.COLOR_TO_ID[self.consts.PLAYER_COLOR]
+        raster = self.jr.draw_rects(
             raster,
-            self.consts.PLAYER_X,
-            jnp.round(state.player_y).astype(jnp.int32),
-            player_mask,
+            jnp.array(
+                [[self.consts.PLAYER_X, jnp.round(state.player_y).astype(jnp.int32)]],
+                dtype=jnp.int32,
+            ),
+            jnp.array(
+                [[state.player_paddle_width, state.player_paddle_height]],
+                dtype=jnp.int32,
+            ),
+            player_color_id,
         )
 
         enemy_mask = self.SHAPE_MASKS["enemy"]

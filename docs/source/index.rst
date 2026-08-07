@@ -65,6 +65,7 @@ To run a game manually:
    scripts/RAMStateDeltas
    scripts/FrameExtractor
    scripts/spriteEditor
+   scripts/jaxatari_accel_plr
 
 .. toctree::
    :maxdepth: 1
