@@ -32,11 +32,17 @@ USE_NATIVE_DOWNSCALING: True
 TRAIN_MODS: null
 EVAL_MODS: null
 
-# Note: This will massively increase compile and run time!
-# Turn off for final reported training run.
-TEST_DURING_TRAINING: False
-TEST_INTERVAL: 0.01 # in terms of total updates
-TEST_NUM_ENVS: 128
-TEST_NUM_STEPS: 10000
-EPS_TEST: 0.0 # 0 for greedy policy
-RECORD_VIDEO: True 
+# Greedy held-out evaluation of the unmodified base game. EVAL_MODS can add
+# game-specific fixed modifications without changing the training environment.
+EVAL_DURING_TRAINING: true
+EVAL_EVERY_STEPS: 1000000
+EVAL_NUM_ENVS: 128
+EVAL_NUM_STEPS: 10000
+EVAL_SEED: 20261011
+EPS_TEST: 0.0
+FINAL_EVAL: true
+EVAL_RECORD_VIDEO: true
+EVAL_VIDEO_BASE: true
+EVAL_VIDEO_MODS: true
+EVAL_VIDEO_MAX_STEPS: 1000
+EVAL_VIDEO_FPS: 30

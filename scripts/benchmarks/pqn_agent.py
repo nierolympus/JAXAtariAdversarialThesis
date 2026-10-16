@@ -129,6 +129,48 @@ class CustomTrainState(TrainState):
     grad_steps: int = 0
 
 
+def _mean_infos(infos, skip=()):
+    """Average ordinary rollout infos while leaving sticky episode fields out."""
+    return {
+        key: jnp.mean(value)
+        for key, value in infos.items()
+        if key not in skip
+    }
+
+
+def _completed_episode_metrics(infos):
+    """Average returns and lengths only where a complete episode ended.
+
+    ``LogWrapper`` carries the most recently completed return and length on
+    every non-terminal step.  Averaging those arrays directly weights old
+    episodes by the number of later rollout steps.  Masking with
+    ``returned_episode`` gives the same completion-only semantics used by the
+    ACCEL runner.
+    """
+    returned = jnp.asarray(infos["returned_episode"], dtype=bool)
+    returned_f = returned.astype(jnp.float32)
+    episode_count = jnp.sum(returned_f)
+    denominator = jnp.maximum(episode_count, 1.0)
+
+    def _completed_mean(key):
+        values = jnp.asarray(infos[key], dtype=jnp.float32)
+        mask = jnp.broadcast_to(returned, values.shape)
+        mean = jnp.sum(jnp.where(mask, values, 0.0)) / denominator
+        return jnp.where(
+            episode_count > 0,
+            mean,
+            jnp.asarray(jnp.nan, dtype=jnp.float32),
+        )
+
+    episode_return = _completed_mean("returned_episode_returns")
+    episode_length = _completed_mean("returned_episode_lengths")
+    return {
+        "returned_episode_returns": episode_return,
+        "returned_episode_lengths": episode_length,
+        "returned_episode_count": episode_count,
+    }
+
+
 def make_train(config):
 
     config["NUM_UPDATES"] = (
@@ -150,12 +192,9 @@ def make_train(config):
     if train_mods is not None:
         train_mods_list = train_mods if isinstance(train_mods, list) else [train_mods]
 
-    has_train_mods = train_mods_list is not None
-
     # Training env: base env or env with TRAIN_MODS.
-    env = jaxatari.make(config["ENV_NAME"].lower(), mods=train_mods_list)
-    mod_env = env
-    renderer = mod_env.renderer
+    base_env = jaxatari.make(config["ENV_NAME"].lower(), mods=train_mods_list)
+    renderer = base_env.renderer
 
     def apply_wrappers(env):
         env = AtariWrapper(env)
@@ -173,8 +212,74 @@ def make_train(config):
         env = LogWrapper(env)
         return env
 
-    env = apply_wrappers(env)
-    mod_env = apply_wrappers(mod_env)
+    env = apply_wrappers(base_env)
+
+    # Keep baseline evaluation independent from TRAIN_MODS and use the same
+    # base/mod split and step-based cadence as the ACCEL runner.  The legacy
+    # TEST_* options remain fallbacks for older configs.
+    eval_during_training = bool(
+        config.get("EVAL_DURING_TRAINING", config.get("TEST_DURING_TRAINING", False))
+    )
+    # Preserve the old no-evaluation behaviour unless evaluation was already
+    # enabled. New comparison configs set FINAL_EVAL explicitly.
+    final_eval = bool(config.get("FINAL_EVAL", eval_during_training))
+    eval_every_steps = int(
+        config.get(
+            "EVAL_EVERY_STEPS",
+            max(
+                1,
+                int(
+                    config["TOTAL_TIMESTEPS"]
+                    * float(config.get("TEST_INTERVAL", 0.1))
+                ),
+            ),
+        )
+    )
+    if eval_every_steps <= 0:
+        raise ValueError("EVAL_EVERY_STEPS must be positive.")
+    eval_num_envs = int(config.get("EVAL_NUM_ENVS", config.get("TEST_NUM_ENVS", 128)))
+    eval_num_steps = int(config.get("EVAL_NUM_STEPS", config.get("TEST_NUM_STEPS", 10_000)))
+    eval_eps = float(config.get("EPS_TEST", 0.0))
+    eval_seed = config.get("EVAL_SEED", None)
+    if eval_seed is not None:
+        eval_seed = int(eval_seed)
+    eval_record_video = bool(
+        config.get("EVAL_RECORD_VIDEO", config.get("RECORD_VIDEO", False))
+    )
+    eval_video_base = bool(config.get("EVAL_VIDEO_BASE", True))
+    eval_video_mods = bool(config.get("EVAL_VIDEO_MODS", True))
+    eval_video_max_steps = int(config.get("EVAL_VIDEO_MAX_STEPS", 1_000))
+    eval_video_fps = int(config.get("EVAL_VIDEO_FPS", 30))
+    if eval_video_max_steps < 0:
+        raise ValueError("EVAL_VIDEO_MAX_STEPS must be non-negative.")
+    if eval_video_fps <= 0:
+        raise ValueError("EVAL_VIDEO_FPS must be positive.")
+
+    eval_mods = config.get("EVAL_MODS", config.get("MOD_NAME", None))
+    if eval_mods is None:
+        eval_mods = []
+    elif not isinstance(eval_mods, list):
+        eval_mods = [eval_mods]
+
+    eval_env_entries = []
+    if eval_during_training or final_eval:
+        unmodified_env = jaxatari.make(config["ENV_NAME"].lower())
+        eval_env_entries.append(
+            ("base", apply_wrappers(unmodified_env), unmodified_env.renderer, False)
+        )
+        for mod_spec in eval_mods:
+            mods = mod_spec if isinstance(mod_spec, list) else [mod_spec]
+            label = "_".join(str(mod).lower() for mod in mods)
+            label = label.replace("/", "_").replace(" ", "_")
+            mod_eval_env = jaxatari.make(config["ENV_NAME"].lower(), mods=mods)
+            eval_env_entries.append(
+                (
+                    f"mod/{label}",
+                    apply_wrappers(mod_eval_env),
+                    mod_eval_env.renderer,
+                    True,
+                )
+            )
 
     # epsilon-greedy exploration
     def eps_greedy_exploration(rng, q_vals, eps):
@@ -243,7 +348,7 @@ def make_train(config):
         # TRAINING LOOP
         def _update_step(runner_state, unused):
 
-            train_state, expl_state, test_metrics, mod_metrics, rng = runner_state
+            train_state, expl_state, eval_metrics_state, rng = runner_state
 
             # SAMPLE PHASE
             def _step_env(carry, _):
@@ -396,41 +501,96 @@ def make_train(config):
             train_state = train_state.replace(n_updates=train_state.n_updates + 1)
             metrics = {
                 "env_step": train_state.timesteps,
+                "num_env_steps": train_state.timesteps,
                 "update_steps": train_state.n_updates,
+                "num_updates": train_state.n_updates,
                 "grad_steps": train_state.grad_steps,
                 "td_loss": loss.mean(),
                 "qvals": qvals.mean(),
             }
-            metrics.update({k: v.mean() for k, v in infos.items()})
-
-            if config.get("TEST_DURING_TRAINING", False):
-                rng, _rng = jax.random.split(rng)
-                test_metrics = jax.lax.cond(
-                    train_state.n_updates
-                    % int(config["NUM_UPDATES"] * config["TEST_INTERVAL"])
-                    == 0,
-                    lambda _: get_test_metrics(train_state, False, _rng),
-                    lambda _: test_metrics,
-                    operand=None,
+            metrics.update(
+                _mean_infos(
+                    infos,
+                    skip=(
+                        "returned_episode_returns",
+                        "returned_episode_lengths",
+                    ),
                 )
-                metrics.update({f"test/{k}": v for k, v in test_metrics.items()})
+            )
+            metrics.update(_completed_episode_metrics(infos))
 
-                if has_train_mods:
-                    rng, _rng = jax.random.split(rng)
-                    mod_metrics = jax.lax.cond(
-                        train_state.n_updates
-                        % int(config["NUM_UPDATES"] * config["TEST_INTERVAL"])
-                        == 0,
-                        lambda _: get_test_metrics(train_state, True, _rng),
-                        lambda _: mod_metrics,
-                        operand=None,
-                    )
-                    metrics.update({f"mod/{k}": v for k, v in mod_metrics.items()})
+            steps_per_update = config["NUM_STEPS"] * config["NUM_ENVS"]
+            previous_timesteps = train_state.timesteps - steps_per_update
+            crossed_eval_boundary = (
+                train_state.timesteps // eval_every_steps
+                > previous_timesteps // eval_every_steps
+            )
+            periodic_eval_due = jnp.logical_and(
+                jnp.asarray(eval_during_training), crossed_eval_boundary
+            )
+            final_eval_due = jnp.logical_and(
+                jnp.asarray(final_eval),
+                train_state.n_updates == config["NUM_UPDATES"],
+            )
+            eval_due = jnp.logical_or(periodic_eval_due, final_eval_due)
+
+            updated_eval_metrics = []
+            for index, (label, eval_fn) in enumerate(eval_fns):
+                rng, eval_rng = jax.random.split(rng)
+                current_eval_metrics = eval_metrics_state[index]
+                current_eval_metrics = jax.lax.cond(
+                    eval_due,
+                    lambda key: eval_fn(train_state, key),
+                    lambda _: current_eval_metrics,
+                    eval_rng,
+                )
+                updated_eval_metrics.append(current_eval_metrics)
+                for key, value in current_eval_metrics.items():
+                    metrics[f"eval/{label}/{key}"] = value
+                    metrics[f"eval/final/{label}/{key}"] = value
+
+            metrics["_eval_due"] = eval_due
+            metrics["_periodic_eval_due"] = periodic_eval_due
+            metrics["_final_eval_due"] = final_eval_due
 
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
 
                 def callback(metrics, original_rng):
+                    metrics = dict(metrics)
+                    should_log_eval = bool(np.asarray(metrics.pop("_eval_due")))
+                    should_log_periodic = bool(
+                        np.asarray(metrics.pop("_periodic_eval_due"))
+                    )
+                    should_log_final = bool(
+                        np.asarray(metrics.pop("_final_eval_due"))
+                    )
+                    if not should_log_eval:
+                        metrics = {
+                            key: value
+                            for key, value in metrics.items()
+                            if not key.startswith("eval/")
+                        }
+                    else:
+                        if not should_log_periodic:
+                            metrics = {
+                                key: value
+                                for key, value in metrics.items()
+                                if not key.startswith("eval/")
+                                or key.startswith("eval/final/")
+                            }
+                        if not should_log_final:
+                            metrics = {
+                                key: value
+                                for key, value in metrics.items()
+                                if not key.startswith("eval/final/")
+                            }
+                    if float(np.asarray(metrics["returned_episode_count"])) <= 0:
+                        for metric_name in (
+                            "returned_episode_returns",
+                            "returned_episode_lengths",
+                        ):
+                            metrics.pop(metric_name, None)
                     if config.get("WANDB_LOG_ALL_SEEDS", False):
                         metrics.update(
                             {
@@ -438,80 +598,134 @@ def make_train(config):
                                 for k, v in metrics.items()
                             }
                         )
-                    wandb.log(metrics, step=metrics["env_step"])
+                    wandb.log(metrics, step=int(np.asarray(metrics["env_step"])))
 
                 jax.debug.callback(callback, metrics, original_rng)
 
-            runner_state = (train_state, tuple(expl_state), test_metrics, mod_metrics, rng)
+            runner_state = (
+                train_state,
+                tuple(expl_state),
+                tuple(updated_eval_metrics),
+                rng,
+            )
 
             return runner_state, metrics
         
-        @partial(jax.jit, static_argnums=(1,))
-        def get_test_metrics(train_state, mod, rng):
-            if not config.get("TEST_DURING_TRAINING", False):
-                return None
+        def _build_eval_fn(label, eval_env, eval_renderer, is_mod):
+            def _evaluate(train_state, rng):
+                if eval_seed is not None:
+                    # Common random numbers make base/ACCEL evaluation curves
+                    # directly comparable at every checkpoint.
+                    rng = jax.random.PRNGKey(eval_seed)
 
-            def _env_step(carry, _):
-                env_state, last_obs, rng = carry
-                rng, _rng = jax.random.split(rng)
-                q_vals = network.apply(
-                    {
-                        "params": train_state.params,
-                        "batch_stats": train_state.batch_stats,
-                    },
-                    last_obs,
-                    train=False,
-                )
-                eps = jnp.full(config["TEST_NUM_ENVS"], config["EPS_TEST"])
-                action = jax.vmap(eps_greedy_exploration)(
-                    jax.random.split(_rng, config["TEST_NUM_ENVS"]), q_vals, eps
-                )
-                if mod:
-                    new_obs, new_env_state, reward, terminated, truncated, info = jax.vmap(mod_env.step)(env_state, action)
-                else:
-                    new_obs, new_env_state, reward, terminated, truncated, info = jax.vmap(env.step)(env_state, action)
-                done = jnp.logical_or(terminated, truncated)
-                env_state_vid = jax.tree.map(lambda x: x[0], new_env_state)
-                dones_vid = jax.tree.map(lambda x: x[0], done)
-                return (new_env_state, new_obs, rng), (info, env_state_vid, dones_vid)
-
-            rng, _rng = jax.random.split(rng)
-            reset_keys = jax.random.split(_rng, config["TEST_NUM_ENVS"])
-            if mod:
-                init_obs, env_state = jax.vmap(mod_env.reset)(reset_keys)
-            else:
-                init_obs, env_state = jax.vmap(env.reset)(reset_keys)
-
-            _, output = jax.lax.scan(
-                _env_step, (env_state, init_obs, _rng), None, config["TEST_NUM_STEPS"]
-            )
-            infos, env_states, dones = output[0], output[1], output[2]
-
-            if config.get("RECORD_VIDEO", False):
-                jax.lax.cond(
-                    train_state.n_updates > 0,
-                    lambda _: jax.debug.callback(video_callback, env_states, dones, train_state.n_updates, renderer, mod=mod),
-                    lambda _: None,
-                    operand=None,
-                )
-
-            # return mean of done infos
-            done_infos = jax.tree_util.tree_map(
-                lambda x: jnp.nanmean(
-                    jnp.where(
-                        infos["returned_episode"],
-                        x.squeeze(),
-                        jnp.nan,
+                def _env_step(carry, _):
+                    env_state, last_obs, rng = carry
+                    rng, action_rng = jax.random.split(rng)
+                    q_vals = network.apply(
+                        {
+                            "params": train_state.params,
+                            "batch_stats": train_state.batch_stats,
+                        },
+                        last_obs,
+                        train=False,
                     )
-                ),
-                infos,
-            )
-            return done_infos
+                    eps = jnp.full(eval_num_envs, eval_eps)
+                    action = jax.vmap(eps_greedy_exploration)(
+                        jax.random.split(action_rng, eval_num_envs), q_vals, eps
+                    )
+                    (
+                        new_obs,
+                        new_env_state,
+                        reward,
+                        terminated,
+                        truncated,
+                        info,
+                    ) = jax.vmap(eval_env.step)(env_state, action)
+                    done = jnp.logical_or(terminated, truncated)
+                    env_state_vid = jax.tree.map(lambda x: x[0], new_env_state)
+                    dones_vid = jax.tree.map(lambda x: x[0], done)
+                    return (new_env_state, new_obs, rng), (
+                        info,
+                        env_state_vid,
+                        dones_vid,
+                    )
 
-        rng, _rng = jax.random.split(rng)
-        test_metrics = get_test_metrics(train_state, False, _rng)
+                rng, reset_rng = jax.random.split(rng)
+                reset_keys = jax.random.split(reset_rng, eval_num_envs)
+                init_obs, env_state = jax.vmap(eval_env.reset)(reset_keys)
 
-        mod_metrics = get_test_metrics(train_state, True, _rng) if has_train_mods else {}
+                _, output = jax.lax.scan(
+                    _env_step,
+                    (env_state, init_obs, rng),
+                    None,
+                    eval_num_steps,
+                )
+                infos, env_states, dones = output
+
+                should_record_video = eval_record_video and eval_video_max_steps > 0 and (
+                    eval_video_mods if is_mod else eval_video_base
+                )
+                if should_record_video:
+                    video_steps = min(eval_video_max_steps, eval_num_steps)
+                    video_states = jax.tree.map(
+                        lambda value: value[:video_steps], env_states
+                    )
+                    video_dones = dones[:video_steps]
+                    jax.debug.callback(
+                        partial(
+                            video_callback,
+                            renderer=eval_renderer,
+                            mod=is_mod,
+                            mod_name=label.removeprefix("mod/") if is_mod else None,
+                            fps=eval_video_fps,
+                            step_metric="num_env_steps",
+                        ),
+                        video_states,
+                        video_dones,
+                        train_state.timesteps,
+                    )
+
+                returned = infos["returned_episode"].squeeze()
+                returned_f = returned.astype(jnp.float32)
+                episode_count = jnp.sum(returned_f)
+                denominator = jnp.maximum(episode_count, 1.0)
+
+                def _masked_mean(values):
+                    values = values.squeeze()
+                    if values.dtype == jnp.bool_:
+                        values = values.astype(jnp.float32)
+                    mask = jnp.broadcast_to(returned, values.shape)
+                    mean = jnp.sum(jnp.where(mask, values, 0.0)) / denominator
+                    return jnp.where(
+                        episode_count > 0,
+                        mean,
+                        jnp.asarray(jnp.nan, dtype=jnp.float32),
+                    )
+
+                return {
+                    "returned_episode_returns": _masked_mean(
+                        infos["returned_episode_returns"]
+                    ),
+                    "returned_episode_lengths": _masked_mean(
+                        infos["returned_episode_lengths"]
+                    ),
+                    "episodes": episode_count,
+                }
+
+            return _evaluate
+
+        eval_fns = [
+            (label, _build_eval_fn(label, eval_env, eval_renderer, is_mod))
+            for label, eval_env, eval_renderer, is_mod in eval_env_entries
+        ]
+        empty_eval_metrics = tuple(
+            {
+                "returned_episode_returns": jnp.asarray(jnp.nan, dtype=jnp.float32),
+                "returned_episode_lengths": jnp.asarray(jnp.nan, dtype=jnp.float32),
+                "episodes": jnp.asarray(0.0, dtype=jnp.float32),
+            }
+            for _ in eval_fns
+        )
 
         rng, _rng = jax.random.split(rng)
         # expl_state = vmap_reset(config["NUM_ENVS"])(_rng)
@@ -519,7 +733,7 @@ def make_train(config):
 
         # train
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, expl_state, test_metrics, mod_metrics, _rng)
+        runner_state = (train_state, expl_state, empty_eval_metrics, _rng)
 
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
@@ -689,9 +903,14 @@ def single_run(config):
             f"jax_{jax.__version__}",
         ],
         name=config.get("NAME", f'{config["ALG_NAME"]}_{config["ENV_NAME"]}'),
+        group=config.get("WANDB_GROUP"),
+        job_type=config.get("WANDB_JOB_TYPE"),
         config=config,
         mode=config["WANDB_MODE"],
     )
+    wandb.define_metric("num_updates")
+    wandb.define_metric("num_env_steps")
+    wandb.define_metric("eval/*", step_metric="num_env_steps")
 
     rng = jax.random.PRNGKey(config["SEED"])
 

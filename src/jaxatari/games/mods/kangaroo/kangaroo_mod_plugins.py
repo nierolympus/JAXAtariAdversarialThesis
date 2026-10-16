@@ -5,7 +5,7 @@ from functools import partial
 from typing import Tuple
 
 from jaxatari.modification import JaxAtariInternalModPlugin, JaxAtariPostStepModPlugin
-from jaxatari.games.jax_kangaroo import KangarooState, PlayerState, LevelState, KangarooConstants
+from jaxatari.games.jax_kangaroo import JaxKangaroo, KangarooState
 from jaxatari.games.kangaroo_levels import LevelConstants, Kangaroo_Level_1, Kangaroo_Level_2, Kangaroo_Level_3
 
 # --- 1. Internal Mods (Group 1) ---
@@ -223,74 +223,10 @@ class SecondLevelOnlyMod(JaxAtariInternalModPlugin):
 
     @partial(jax.jit, static_argnums=(0,))
     def reset_level(self, next_level=1) -> KangarooState:
-        next_level = 2
-        level_constants = Kangaroo_Level_2
-        main_consts = KangarooConstants()
-        new_state = KangarooState(
-            player=PlayerState(
-                x=jnp.array(main_consts.PLAYER_START_X),
-                y=jnp.array(main_consts.PLAYER_START_Y),
-                vel_x=jnp.array(0),
-                is_crouching=jnp.array(False),
-                is_jumping=jnp.array(False),
-                is_climbing=jnp.array(False),
-                jump_counter=jnp.array(0),
-                orientation=jnp.array(1),
-                jump_base_y=jnp.array(main_consts.PLAYER_START_Y),
-                landing_base_y=jnp.array(main_consts.PLAYER_START_Y),
-                height=jnp.array(main_consts.PLAYER_HEIGHT),
-                jump_orientation=jnp.array(0),
-                climb_base_y=jnp.array(main_consts.PLAYER_START_Y),
-                climb_counter=jnp.array(0),
-                punch_left=jnp.array(False),
-                punch_right=jnp.array(False),
-                cooldown_counter=jnp.array(0),
-                chrash_timer=jnp.array(0),
-                is_crashing=jnp.array(False),
-                last_stood_on_platform_y=jnp.array(1000),
-                walk_animation=jnp.array(0),
-                punch_counter=jnp.array(0),
-                needs_release=jnp.array(False),
-            ),
-            level=LevelState(
-                bell_position=level_constants.bell_position,
-                bell_timer=jnp.array(0),
-                fruit_positions=level_constants.fruit_positions,
-                fruit_actives=jnp.ones(3, dtype=jnp.bool_),
-                fruit_stages=jnp.zeros(3, dtype=jnp.int32),
-                ladder_positions=level_constants.ladder_positions,
-                ladder_sizes=level_constants.ladder_sizes,
-                platform_positions=level_constants.platform_positions,
-                platform_sizes=level_constants.platform_sizes,
-                child_position=level_constants.child_position,
-                child_timer=jnp.array(0),
-                child_velocity=jnp.array(1),
-                timer=jnp.array(2000),  # to be modified
-                falling_coco_position=jnp.array([13, -1]),
-                falling_coco_dropping=jnp.array(False),
-                falling_coco_counter=jnp.array(0),
-                falling_coco_skip_update=jnp.array(False),
-                step_counter=jnp.array(0),
-                monkey_states=jnp.zeros(4, dtype=jnp.int32),
-                monkey_positions=jnp.array([[152, 5], [152, 5], [152, 5], [152, 5]]),
-                monkey_throw_timers=jnp.zeros(4, dtype=jnp.int32),
-                spawn_protection=jnp.array(True),
-                coco_positions=jnp.array(
-                    [[-10, -10], [-10, -10], [-10, -10], [-10, -10]]
-                ),
-                coco_states=jnp.zeros(4, dtype=jnp.int32),
-                spawn_position=jnp.array(False),
-                bell_animation=jnp.array(0),
-            ),
-            score=jnp.array(0),
-            current_level=next_level,
-            level_finished=jnp.array(False),
-            levelup_timer=jnp.array(0),
-            reset_coords=jnp.array(False),
-            levelup=jnp.array(False),
-            lives=jnp.array(3),
-        )
-        return new_state
+        # Reuse the game's canonical reset so object arrays keep the same padded
+        # shape as the declared observation space.  Calling the class method
+        # bypasses this instance-level mod patch and avoids recursion.
+        return JaxKangaroo.reset_level(self._env, 2)
 
 class ThirdLevelOnlyMod(JaxAtariInternalModPlugin):
     """
@@ -318,74 +254,7 @@ class ThirdLevelOnlyMod(JaxAtariInternalModPlugin):
     
     @partial(jax.jit, static_argnums=(0,))
     def reset_level(self, next_level=1) -> KangarooState:
-        next_level = 3
-        level_constants = Kangaroo_Level_3
-        main_consts = KangarooConstants()
-        new_state = KangarooState(
-            player=PlayerState(
-                x=jnp.array(main_consts.PLAYER_START_X),
-                y=jnp.array(main_consts.PLAYER_START_Y),
-                vel_x=jnp.array(0),
-                is_crouching=jnp.array(False),
-                is_jumping=jnp.array(False),
-                is_climbing=jnp.array(False),
-                jump_counter=jnp.array(0),
-                orientation=jnp.array(1),
-                jump_base_y=jnp.array(main_consts.PLAYER_START_Y),
-                landing_base_y=jnp.array(main_consts.PLAYER_START_Y),
-                height=jnp.array(main_consts.PLAYER_HEIGHT),
-                jump_orientation=jnp.array(0),
-                climb_base_y=jnp.array(main_consts.PLAYER_START_Y),
-                climb_counter=jnp.array(0),
-                punch_left=jnp.array(False),
-                punch_right=jnp.array(False),
-                cooldown_counter=jnp.array(0),
-                chrash_timer=jnp.array(0),
-                is_crashing=jnp.array(False),
-                last_stood_on_platform_y=jnp.array(1000),
-                walk_animation=jnp.array(0),
-                punch_counter=jnp.array(0),
-                needs_release=jnp.array(False),
-            ),
-            level=LevelState(
-                bell_position=level_constants.bell_position,
-                bell_timer=jnp.array(0),
-                fruit_positions=level_constants.fruit_positions,
-                fruit_actives=jnp.ones(3, dtype=jnp.bool_),
-                fruit_stages=jnp.zeros(3, dtype=jnp.int32),
-                ladder_positions=level_constants.ladder_positions,
-                ladder_sizes=level_constants.ladder_sizes,
-                platform_positions=level_constants.platform_positions,
-                platform_sizes=level_constants.platform_sizes,
-                child_position=level_constants.child_position,
-                child_timer=jnp.array(0),
-                child_velocity=jnp.array(1),
-                timer=jnp.array(2000),  # to be modified
-                falling_coco_position=jnp.array([13, -1]),
-                falling_coco_dropping=jnp.array(False),
-                falling_coco_counter=jnp.array(0),
-                falling_coco_skip_update=jnp.array(False),
-                step_counter=jnp.array(0),
-                monkey_states=jnp.zeros(4, dtype=jnp.int32),
-                monkey_positions=jnp.array([[152, 5], [152, 5], [152, 5], [152, 5]]),
-                monkey_throw_timers=jnp.zeros(4, dtype=jnp.int32),
-                spawn_protection=jnp.array(True),
-                coco_positions=jnp.array(
-                    [[-10, -10], [-10, -10], [-10, -10], [-10, -10]]
-                ),
-                coco_states=jnp.zeros(4, dtype=jnp.int32),
-                spawn_position=jnp.array(False),
-                bell_animation=jnp.array(0),
-            ),
-            score=jnp.array(0),
-            current_level=next_level,
-            level_finished=jnp.array(False),
-            levelup_timer=jnp.array(0),
-            reset_coords=jnp.array(False),
-            levelup=jnp.array(False),
-            lives=jnp.array(3),
-        )
-        return new_state
+        return JaxKangaroo.reset_level(self._env, 3)
 
 # --- 2. Post-Step Mod (Group 2) ---
 

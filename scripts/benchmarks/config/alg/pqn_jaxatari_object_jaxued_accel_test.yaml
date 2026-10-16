@@ -30,8 +30,9 @@ OBJECT_CENTRIC: True
 # JAXAtari adversarial wrapper workflow
 ADV_WRAPPER: "pong"
 ACCEL_STRENGTH: 2.0
-ACCEL_MAX_LEVEL_SIZE: 2
-ACCEL_PLAYER_PADDLE_HEIGHT_MULTIPLIER: 1.75
+ACCEL_MAX_LEVEL_SIZE: 4
+# ACCEL morphology may only keep or shrink the original paddle size.
+ACCEL_PLAYER_PADDLE_HEIGHT_MULTIPLIER: 1.0
 
 # JAXUED LevelSampler settings
 ACCEL_BUFFER_CAPACITY: 16
@@ -44,10 +45,15 @@ TOPK_K: 4
 BUFFER_DUPLICATE_CHECK: true
 
 # Score for mask levels:
-# - q_pvl_all_steps: dense Q-learning PVL proxy, safest for short Atari rollouts
-# - pvl: direct jaxued.utils.positive_value_loss(dones, lambda_targets - chosen_q)
+# - q_pvl: dense truncated PLR regret proxy (recommended for PQN/Pong)
+# - env_learning_progress: normalized change in raw return EMA (Q-free fallback)
+# - env_return: negative summed raw environment return (difficulty baseline)
+# - q_pvl_all_steps: backward-compatible alias for q_pvl
+# - pvl: episodic jaxued.utils.positive_value_loss (needs a completed episode)
 # - max_mc: direct jaxued.utils.max_mc
-JAXUED_SCORE_FUNCTION: "q_pvl_all_steps"
+JAXUED_SCORE_FUNCTION: "env_learning_progress"
+JAXUED_REWARD_PROGRESS_EMA_ALPHA: 0.20
+JAXUED_REWARD_PROGRESS_NEW_LEVEL_SCORE: 1.0
 JAXUED_INCOMPLETE_SCORE: 0.0
 EXPLORATORY_GRAD_UPDATES: true
 
@@ -66,7 +72,7 @@ EVAL_VIDEO_FPS: 30
 TRAIN_RECORD_ACCEL_VIDEO: false
 TRAIN_ACCEL_VIDEO_COUNT: 5
 TRAIN_ACCEL_VIDEO_MAX_STEPS: 32
-ACCEL_VIDEO_OVERLAY_HEIGHT: 24
+ACCEL_VIDEO_OVERLAY_HEIGHT: 32
 
 HYP_TUNE: false
 ENTITY: null

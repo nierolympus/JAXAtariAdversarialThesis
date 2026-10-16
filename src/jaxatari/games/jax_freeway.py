@@ -45,6 +45,13 @@ class FreewayConstants(AutoDerivedConstants):
     chicken_x: int = struct.field(pytree_node=False, default=44)  # Fixed x position
     car_width: int = struct.field(pytree_node=False, default=8)
     car_height: int = struct.field(pytree_node=False, default=10)
+    car_speed_multiplier: float = struct.field(pytree_node=False, default=1.0)
+    car_speed_multiplier_min: float = struct.field(pytree_node=False, default=0.5)
+    car_speed_multiplier_max: float = struct.field(pytree_node=False, default=2.0)
+    car_width_min: int = struct.field(pytree_node=False, default=4)
+    car_width_max: int = struct.field(pytree_node=False, default=16)
+    car_height_min: int = struct.field(pytree_node=False, default=6)
+    car_height_max: int = struct.field(pytree_node=False, default=14)
     num_lanes: int = struct.field(pytree_node=False, default=10)
     lane_spacing: int = struct.field(pytree_node=False, default=16)
     top_border: int = struct.field(pytree_node=False, default=15)
@@ -166,8 +173,12 @@ class FreewayState:
     """Represents the current state of the game"""
     chicken_y: chex.Array
     cars: chex.Array  # Shape: (num_lanes, 2) for x,y positions (ints for render/collide)
-    # Per-lane cadence counters (frames), advance independently to sync movement patterns per lane
+    # Per-lane cadence phase. Float phases let ACCEL represent fractional
+    # global speed multipliers without losing sub-pixel progress.
     lane_time: chex.Array
+    car_speed_multiplier: chex.Array
+    car_width: chex.Array
+    car_height: chex.Array
     score: chex.Array
     time: chex.Array
     cooldown: chex.Array  # Cooldown after collision
@@ -235,12 +246,19 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
 
         # Initialize per-lane cadence counters using configured phase offsets
         periods0 = jnp.abs(jnp.array(self.consts.CAR_UPDATES, dtype=jnp.int32))
-        phases0 = jnp.array(self.consts.cadence_phase_offset, dtype=jnp.int32) % periods0
+        phases0 = (
+            jnp.array(self.consts.cadence_phase_offset, dtype=jnp.int32) % periods0
+        ).astype(jnp.float32)
 
         state = FreewayState(
             chicken_y=jnp.array(chicken_y, dtype=jnp.int32),
             cars=cars,
             lane_time=phases0,
+            car_speed_multiplier=jnp.array(
+                self.consts.car_speed_multiplier, dtype=jnp.float32
+            ),
+            car_width=jnp.array(self.consts.car_width, dtype=jnp.int32),
+            car_height=jnp.array(self.consts.car_height, dtype=jnp.int32),
             score=jnp.array(0, dtype=jnp.int32),
             time=jnp.array(0, dtype=jnp.int32),
             cooldown=jnp.array(0, dtype=jnp.int32),
@@ -288,37 +306,51 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
             self.consts.bottom_border + self.consts.chicken_height - 1,
         ).astype(jnp.int32)
 
-        # Implements the [0, 0, ..., 1] repeating pattern based on CAR_UPDATES
-        periods = jnp.abs(jnp.array(self.consts.CAR_UPDATES, dtype=jnp.int32))
+        # Advance each lane's phase by the episode-level speed multiplier.
+        # At 1.0 this is exactly the original [0, ..., 1] cadence. Fractional
+        # values retain progress, and values above one may advance several
+        # pixels on lanes whose native period is short.
+        periods_i = jnp.abs(jnp.array(self.consts.CAR_UPDATES, dtype=jnp.int32))
+        periods = periods_i.astype(jnp.float32)
         signs = jnp.sign(jnp.array(self.consts.CAR_UPDATES, dtype=jnp.int32))
-        # Per-lane cadence counters: move when the counter reaches period-1, then keep advancing
-        should_move_mask = (state.lane_time == (periods - 1))
-        delta_x = jnp.where(should_move_mask, signs, 0).astype(jnp.int32)
+        advanced_phase = state.lane_time + state.car_speed_multiplier
+        movement_steps = jnp.floor(advanced_phase / periods).astype(jnp.int32)
+        delta_x = (signs * movement_steps).astype(jnp.int32)
+        new_lane_time = jnp.mod(advanced_phase, periods).astype(jnp.float32)
 
         # Apply moves to integer x positions
         pre_x = state.cars[:, 0]
         x_int = pre_x + delta_x
 
+        car_width = state.car_width.astype(jnp.int32)
+        car_height = state.car_height.astype(jnp.int32)
+
         # Wrap positions to [-car_width, screen_width)
-        range_len_i = self.consts.screen_width + self.consts.car_width
-        x_int_wrapped = ((x_int + self.consts.car_width) % range_len_i) - self.consts.car_width
+        range_len_i = self.consts.screen_width + car_width
+        x_int_wrapped = ((x_int + car_width) % range_len_i) - car_width
 
         # Apply respawn offset only to entries that wrapped this frame
         wrapped_right = jnp.logical_and(signs > 0, x_int >= self.consts.screen_width)
-        wrapped_left = jnp.logical_and(signs < 0, x_int < -self.consts.car_width)
+        wrapped_left = jnp.logical_and(signs < 0, x_int < -car_width)
 
         offset = jnp.asarray(self.consts.respawn_offset, dtype=jnp.int32)
         adjusted = x_int_wrapped
         adjusted = jnp.where(wrapped_right, x_int_wrapped + offset, adjusted)
         adjusted = jnp.where(wrapped_left, x_int_wrapped - offset, adjusted)
         # Keep within valid range after offset
-        adjusted = jnp.clip(adjusted, -self.consts.car_width, self.consts.screen_width - 1)
+        adjusted = jnp.clip(adjusted, -car_width, self.consts.screen_width - 1)
 
-        # Update integer car positions
+        # Keep resized cars centered in their native lanes.
+        lane_y = (
+            jnp.asarray(self.consts.lane_borders[: self.consts.num_lanes], dtype=jnp.int32)
+            + self.consts.lane_spacing // 2
+            - car_height // 2
+            + self.consts.car_y_offset
+        )
+
+        # Update integer car positions and size-dependent lane alignment.
         new_cars = state.cars.at[:, 0].set(adjusted.astype(jnp.int32))
-
-        # Advance per-lane cadence counters
-        new_lane_time = (state.lane_time + 1) % periods
+        new_cars = new_cars.at[:, 1].set(lane_y.astype(jnp.int32))
 
         # Check for collisions
         def check_collision(car_pos):
@@ -337,8 +369,8 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
             kyi_top = jnp.asarray(self.consts.car_hit_inset_y_top, dtype=jnp.int32)
             kyi_bottom = jnp.asarray(self.consts.car_hit_inset_y_bottom, dtype=jnp.int32)
             car_x0 = car_x + kxi
-            car_x1 = car_x + self.consts.car_width - kxi
-            car_y0 = car_y - self.consts.car_height + kyi_top
+            car_x1 = car_x + car_width - kxi
+            car_y0 = car_y - car_height + kyi_top
             car_y1 = car_y - kyi_bottom
 
             overlap_x = jnp.logical_and(ch_x0 < car_x1, ch_x1 > car_x0)
@@ -393,6 +425,9 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
             chicken_y=new_y,
             cars=new_cars,
             lane_time=new_lane_time,
+            car_speed_multiplier=state.car_speed_multiplier,
+            car_width=car_width,
+            car_height=car_height,
             score=new_score,
             time=new_time,
             cooldown=new_cooldown,
@@ -426,8 +461,8 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
                     [
                         car_pos.at[0].get(),  # x position
                         car_pos.at[1].get(),  # y position
-                        self.consts.car_width,  # width
-                        self.consts.car_height,  # height
+                        state.car_width,  # width
+                        state.car_height,  # height
                     ],
                     dtype=jnp.int32
                 )
@@ -616,6 +651,45 @@ class FreewayRenderer(JAXGameRenderer):
         return black_bar
 
     @partial(jax.jit, static_argnums=(0,))
+    def _render_car_at_size(self, raster, x, y, car_mask, width, height):
+        """Render a car sprite at dynamic state dimensions.
+
+        JAX requires static array shapes, so constructing a dynamically sized
+        sprite inside ``render`` is not possible. Instead, inverse-map the
+        fixed output raster into the original sprite. At the native 8x10 size
+        this samples the same sprite pixels as ``render_at_clipped``.
+        """
+        scaled_x = jnp.round(x * self.config.width_scaling).astype(jnp.int32)
+        scaled_y = jnp.round(y * self.config.height_scaling).astype(jnp.int32)
+        scaled_width = jnp.maximum(
+            1, jnp.round(width * self.config.width_scaling)
+        ).astype(jnp.int32)
+        scaled_height = jnp.maximum(
+            1, jnp.round(height * self.config.height_scaling)
+        ).astype(jnp.int32)
+
+        relative_x = self.jr._xx - scaled_x
+        relative_y = self.jr._yy - scaled_y
+        inside = (
+            (relative_x >= 0)
+            & (relative_x < scaled_width)
+            & (relative_y >= 0)
+            & (relative_y < scaled_height)
+        )
+
+        source_x = jnp.floor(
+            relative_x.astype(jnp.float32) * car_mask.shape[1] / scaled_width
+        ).astype(jnp.int32)
+        source_y = jnp.floor(
+            relative_y.astype(jnp.float32) * car_mask.shape[0] / scaled_height
+        ).astype(jnp.int32)
+        source_x = jnp.clip(source_x, 0, car_mask.shape[1] - 1)
+        source_y = jnp.clip(source_y, 0, car_mask.shape[0] - 1)
+        sampled = car_mask[source_y, source_x].astype(raster.dtype)
+        sampled = jnp.where(inside, sampled, self.jr.TRANSPARENT_ID)
+        return jnp.where(sampled != self.jr.TRANSPARENT_ID, sampled, raster)
+
+    @partial(jax.jit, static_argnums=(0,))
     def render(self, state):
         raster = self.jr.create_object_raster(self.BACKGROUND)
 
@@ -659,7 +733,14 @@ class FreewayRenderer(JAXGameRenderer):
             else:
                 mask_key = sprite_name
             car_mask = self.SHAPE_MASKS[mask_key]
-            raster = self.jr.render_at_clipped(raster, state.cars[i, 0], state.cars[i, 1], car_mask)
+            raster = self._render_car_at_size(
+                raster,
+                state.cars[i, 0],
+                state.cars[i, 1],
+                car_mask,
+                state.car_width,
+                state.car_height,
+            )
 
         # --- SCORE RENDERING ---
         should_blink = state.time >= self.consts.blink_start_frames

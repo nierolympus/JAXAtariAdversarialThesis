@@ -68,6 +68,21 @@ class SeaquestConstants(AutoDerivedConstants):
     PLAYER_START_X: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array(76))
     PLAYER_START_Y: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array(46))
 
+    # Runtime velocity controls.  Their defaults reproduce the original game;
+    # ACCEL changes the matching SeaquestState fields before each physics step.
+    PLAYER_MOVE_SPEED: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array(1))
+    PLAYER_MOVE_SPEED_MIN: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array(1))
+    PLAYER_MOVE_SPEED_MAX: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array(3))
+    ENEMY_SPEED_MULTIPLIER: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array(1))
+    ENEMY_SPEED_MULTIPLIER_MIN: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array(1))
+    ENEMY_SPEED_MULTIPLIER_MAX: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array(3))
+    PLAYER_MISSILE_SPEED: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array(5))
+    PLAYER_MISSILE_SPEED_MIN: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array(1))
+    PLAYER_MISSILE_SPEED_MAX: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array(8))
+    ENEMY_MISSILE_SPEED_MULTIPLIER: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array(1))
+    ENEMY_MISSILE_SPEED_MULTIPLIER_MIN: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array(1))
+    ENEMY_MISSILE_SPEED_MULTIPLIER_MAX: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array(3))
+
     X_BORDERS: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array([0, 160]))
     PLAYER_BOUNDS: jnp.ndarray = struct.field(pytree_node=False, default_factory=lambda: jnp.array([[21, 134], [46, 141]]))
 
@@ -141,6 +156,12 @@ class SeaquestState:
     player_x: chex.Array
     player_y: chex.Array
     player_direction: chex.Array  # 0 for right, 1 for left
+    # Explicit dynamics parameters make velocity selectable before collision
+    # handling without applying unsafe post-step deltas to packed entity arrays.
+    player_move_speed: chex.Array
+    enemy_speed_multiplier: chex.Array
+    player_missile_speed: chex.Array
+    enemy_missile_speed_multiplier: chex.Array
     oxygen: chex.Array
     divers_collected: chex.Array
     score: chex.Array
@@ -922,6 +943,7 @@ class JaxSeaquest(JaxEnvironment[SeaquestState, SeaquestObservation, SeaquestInf
         shark_positions: chex.Array,
         sub_positions: chex.Array,
         step_counter: chex.Array,
+        speed_multiplier: chex.Array,
         rng: chex.PRNGKey,
     ) -> Tuple[chex.Array, chex.Array, SpawnState, chex.PRNGKey]:
         """Update enemy positions based on their patterns"""
@@ -992,7 +1014,9 @@ class JaxSeaquest(JaxEnvironment[SeaquestState, SeaquestObservation, SeaquestInf
             """Moves a single enemy. This function will be vmapped."""
             is_active = jnp.logical_not(self.is_slot_empty(pos))
 
-            movement_speed = calculate_movement_speed(step_counter, difficulty)
+            movement_speed = (
+                calculate_movement_speed(step_counter, difficulty) * speed_multiplier
+            )
             velocity_x = pos[2] * movement_speed # pos[2] is direction (-1 or 1)
 
             # Use modulo 4 to map 8 virtual lanes to 4 physical Y-positions
@@ -1561,7 +1585,12 @@ class JaxSeaquest(JaxEnvironment[SeaquestState, SeaquestObservation, SeaquestInf
         # Move existing enemies
         new_shark_positions, new_sub_positions, spawn_state_after_movement, new_key = (
             self.step_enemy_movement(
-                spawn_state, shark_positions, sub_positions, state.step_counter, rng_key
+                spawn_state,
+                shark_positions,
+                sub_positions,
+                state.step_counter,
+                state.enemy_speed_multiplier,
+                rng_key,
             )
         )
 
@@ -1606,7 +1635,7 @@ class JaxSeaquest(JaxEnvironment[SeaquestState, SeaquestObservation, SeaquestInf
             sub_pos = carry
             new_x = jnp.where(
                 state.step_counter % 4 == 0,
-                sub_pos[0] - 1,  # Direction always -1
+                sub_pos[0] - state.enemy_speed_multiplier,  # Direction always -1
                 sub_pos[0],
             )
 
@@ -1637,7 +1666,12 @@ class JaxSeaquest(JaxEnvironment[SeaquestState, SeaquestObservation, SeaquestInf
 
     @partial(jax.jit, static_argnums=(0,))
     def enemy_missiles_step(
-        self, curr_sub_positions, curr_enemy_missile_positions, step_counter, difficulty
+        self,
+        curr_sub_positions,
+        curr_enemy_missile_positions,
+        step_counter,
+        difficulty,
+        speed_multiplier,
     ) -> chex.Array:
 
         def calculate_missile_speed(step_counter, difficulty):
@@ -1729,7 +1763,9 @@ class JaxSeaquest(JaxEnvironment[SeaquestState, SeaquestObservation, SeaquestInf
             new_missile = jnp.where(should_spawn, spawned_missile, missile_pos)
 
             # Move the missile if it exists
-            movement_speed = calculate_missile_speed(step_counter, difficulty)
+            movement_speed = (
+                calculate_missile_speed(step_counter, difficulty) * speed_multiplier
+            )
             velocity = movement_speed * new_missile[2]
             moved_missile = new_missile.at[0].add(velocity)
             new_missile = jnp.where(missile_exists, moved_missile, new_missile)
@@ -1787,11 +1823,16 @@ class JaxSeaquest(JaxEnvironment[SeaquestState, SeaquestObservation, SeaquestInf
             state.player_missile_position,
         )
 
-        # if a missile is in frame and exists, we move the missile further in the specified direction (5 per tick), also always put the missile at the current player y position
+        # If a missile is in frame, move it by the selected runtime speed.  The
+        # baseline value is five pixels, matching the original game exactly.
         new_missile = jnp.where(
             missile_exists,
             jnp.array(
-                [new_missile[0] + new_missile[2] * 5, curr_player_y + 7, new_missile[2]]
+                [
+                    new_missile[0] + new_missile[2] * state.player_missile_speed,
+                    curr_player_y + 7,
+                    new_missile[2],
+                ]
             ),
             new_missile,
         )
@@ -1989,11 +2030,15 @@ class JaxSeaquest(JaxEnvironment[SeaquestState, SeaquestObservation, SeaquestInf
         )
 
         player_x = jnp.where(
-            right, state.player_x + 1, jnp.where(left, state.player_x - 1, state.player_x)
+            right,
+            state.player_x + state.player_move_speed,
+            jnp.where(left, state.player_x - state.player_move_speed, state.player_x),
         )
 
         player_y = jnp.where(
-            down, state.player_y + 1, jnp.where(up, state.player_y - 1, state.player_y)
+            down,
+            state.player_y + state.player_move_speed,
+            jnp.where(up, state.player_y - state.player_move_speed, state.player_y),
         )
 
         # set the direction according to the movement
@@ -2231,6 +2276,12 @@ class JaxSeaquest(JaxEnvironment[SeaquestState, SeaquestObservation, SeaquestInf
             player_x=jnp.array(self.consts.PLAYER_START_X),
             player_y=jnp.array(self.consts.PLAYER_START_Y),
             player_direction=jnp.array(0),
+            player_move_speed=jnp.array(self.consts.PLAYER_MOVE_SPEED),
+            enemy_speed_multiplier=jnp.array(self.consts.ENEMY_SPEED_MULTIPLIER),
+            player_missile_speed=jnp.array(self.consts.PLAYER_MISSILE_SPEED),
+            enemy_missile_speed_multiplier=jnp.array(
+                self.consts.ENEMY_MISSILE_SPEED_MULTIPLIER
+            ),
             oxygen=jnp.array(0),  # Full oxygen
             divers_collected=jnp.array(0),
             score=jnp.array(0),
@@ -2276,6 +2327,7 @@ class JaxSeaquest(JaxEnvironment[SeaquestState, SeaquestObservation, SeaquestInf
                     state.shark_positions,
                     state.sub_positions,
                     state.step_counter,
+                    state.enemy_speed_multiplier,
                     state.rng_key,
                 )
                 new_shark_positions = state.shark_positions.at[:, 1].set(
@@ -2353,6 +2405,7 @@ class JaxSeaquest(JaxEnvironment[SeaquestState, SeaquestObservation, SeaquestInf
                 state.shark_positions,
                 state.sub_positions,
                 state.step_counter,
+                state.enemy_speed_multiplier,
                 state.rng_key,
             )
             new_shark_positions = state.shark_positions.at[:, 1].set(
@@ -2532,6 +2585,7 @@ class JaxSeaquest(JaxEnvironment[SeaquestState, SeaquestObservation, SeaquestInf
                 state_updated.enemy_missile_positions,
                 state_updated.step_counter,
                 state_updated.spawn_state.difficulty,
+                state_updated.enemy_missile_speed_multiplier,
             )
 
             # append the surface submarine to the other submarines for the collision check
@@ -2585,6 +2639,12 @@ class JaxSeaquest(JaxEnvironment[SeaquestState, SeaquestObservation, SeaquestInf
                 player_x=player_x,
                 player_y=player_y,
                 player_direction=player_direction,
+                player_move_speed=state_updated.player_move_speed,
+                enemy_speed_multiplier=state_updated.enemy_speed_multiplier,
+                player_missile_speed=state_updated.player_missile_speed,
+                enemy_missile_speed_multiplier=(
+                    state_updated.enemy_missile_speed_multiplier
+                ),
                 oxygen=new_oxygen,
                 divers_collected=new_divers_collected,
                 score=new_score,

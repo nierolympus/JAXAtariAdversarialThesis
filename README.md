@@ -83,6 +83,9 @@ mod_env = jaxatari.make("pong", mods=["lazy_enemy", "shift_enemy"])
 Developing custom modications is well supported via the JaxAtariModController.
 Feel free to share them by opening a PR.
 
+For the configurable Pong ACCEL/scaling experiment, see the
+[Pong ACCEL configuration reference](PONG_ACCEL_CONFIG.md).
+
 ### Using Wrappers
 
 JAXAtari provides a comprehensive wrapper system for different use cases:

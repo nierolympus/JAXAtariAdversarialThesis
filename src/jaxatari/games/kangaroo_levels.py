@@ -20,6 +20,23 @@ class LevelConstants(NamedTuple):
     child_position: chex.Array
 
 
+class KangarooLevel(NamedTuple):
+    """Fixed-shape static layout stored by PLR/ACCEL.
+
+    The leading axis selects Kangaroo's three stages. Runtime state such as
+    fruit activation, monkeys, coconuts, and the moving child deliberately
+    stays in ``KangarooState``. Fruit and bell coordinates are stable layout
+    data, so they can be varied without resetting moving entities each step.
+    """
+
+    ladder_positions: chex.Array
+    ladder_sizes: chex.Array
+    platform_positions: chex.Array
+    platform_sizes: chex.Array
+    fruit_positions: chex.Array
+    bell_positions: chex.Array
+
+
 LADDER_HEIGHT = jnp.array(36)
 LADDER_WIDTH = jnp.array(8)
 P_HEIGHT = jnp.array(4)

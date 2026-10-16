@@ -17,15 +17,39 @@ def video_callback(
     mod_name=None,
     mod_actions=None,
     adversary_video=False,
+    fps=30,
+    step_metric=None,
 ):
     """
     Starting a new thread to render video so that it doesn't block training.
     """
     # video_thread = threading.Thread(target=video_renderer, args=(states, dones, step, renderer, mod))
     # video_thread.start()
-    video_renderer(states, dones, step, renderer, mod, mod_name, mod_actions, adversary_video)
+    video_renderer(
+        states,
+        dones,
+        step,
+        renderer,
+        mod,
+        mod_name,
+        mod_actions,
+        adversary_video,
+        fps,
+        step_metric,
+    )
 
-def video_renderer(states, dones, step, renderer, mod, mod_name, mod_actions, adversary_video):
+def video_renderer(
+    states,
+    dones,
+    step,
+    renderer,
+    mod,
+    mod_name,
+    mod_actions,
+    adversary_video,
+    fps=30,
+    step_metric=None,
+):
     print("Rendering video...")
     video_folder = f"{wandb.run.dir}/media/videos/"
     os.makedirs(video_folder, exist_ok=True)
@@ -87,7 +111,6 @@ def video_renderer(states, dones, step, renderer, mod, mod_name, mod_actions, ad
     # but should be (N, 3, W, H)
     frames = np.transpose(frames, (0, 3, 1, 2))
 
-    fps = 30 
     video = wandb.Video(frames, fps=fps, format="mp4")
     name = f"video_{step}"
     if mod:
@@ -98,7 +121,13 @@ def video_renderer(states, dones, step, renderer, mod, mod_name, mod_actions, ad
             name = f"video_{step}_mod"
     if adversary_video:
         name = f"{name}_adversary"
-    wandb.log({name: video})
+    payload = {name: video}
+    if step_metric is None:
+        wandb.log(payload)
+    else:
+        host_step = int(np.asarray(step))
+        payload[step_metric] = host_step
+        wandb.log(payload, step=host_step)
     print("Video done.")
 
 def save_params(params: Dict, filename: Union[str, os.PathLike]) -> None:

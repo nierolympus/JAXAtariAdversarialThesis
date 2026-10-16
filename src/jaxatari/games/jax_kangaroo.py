@@ -12,7 +12,9 @@ from jaxatari.environment import JaxEnvironment, ObjectObservation, JAXAtariActi
 from jaxatari.renderers import JAXGameRenderer
 import jaxatari.rendering.jax_rendering_utils as render_utils
 from jaxatari.games.kangaroo_levels import (
+    KangarooLevel,
     LevelConstants,
+    MAX_PLATFORMS as LEVEL_GEOMETRY_CAPACITY,
     Kangaroo_Level_1,
     Kangaroo_Level_2,
     Kangaroo_Level_3,
@@ -272,13 +274,25 @@ class JaxKangaroo(JaxEnvironment[KangarooState, KangarooObservation, KangarooInf
     def _get_valid_platforms(self, level_constants: LevelConstants) -> chex.Array:
         return level_constants.platform_positions[:, 0] != -1
 
+    def _get_state_level_constants(self, state: KangarooState) -> LevelConstants:
+        """Return the live layout used by rendering, observations, and physics."""
+        return LevelConstants(
+            ladder_positions=state.level.ladder_positions,
+            ladder_sizes=state.level.ladder_sizes,
+            platform_positions=state.level.platform_positions,
+            platform_sizes=state.level.platform_sizes,
+            fruit_positions=state.level.fruit_positions,
+            bell_position=state.level.bell_position,
+            child_position=state.level.child_position,
+        )
+
     @partial(jax.jit, static_argnums=(0, 2), donate_argnums=(1,))
     def _get_platforms_below_player(self, state: KangarooState, y_offset=0) -> chex.Array:
         player_x = state.player.x
         player_y = state.player.y + y_offset
         player_bottom_y = player_y + state.player.height
 
-        level_constants: LevelConstants = self._get_level_constants(state.current_level)
+        level_constants = self._get_state_level_constants(state)
 
         platform_positions = level_constants.platform_positions
         platform_sizes = level_constants.platform_sizes
@@ -360,7 +374,7 @@ class JaxKangaroo(JaxEnvironment[KangarooState, KangarooObservation, KangarooInf
 
     @partial(jax.jit, static_argnums=(0, 2, 3), donate_argnums=(1,))
     def _player_is_above_ladder(self, state: KangarooState, threshold: float = 0.3, virtual_hitbox_height: float = 12.0) -> chex.Array:
-        level_constants: LevelConstants = self._get_level_constants(state.current_level)
+        level_constants = self._get_state_level_constants(state)
 
         ladder_x = level_constants.ladder_positions[:, 0]
         ladder_y = level_constants.ladder_positions[:, 1]
@@ -384,7 +398,7 @@ class JaxKangaroo(JaxEnvironment[KangarooState, KangarooObservation, KangarooInf
 
     @partial(jax.jit, static_argnums=(0, 2), donate_argnums=(1,))
     def _check_ladder_collisions(self, state: KangarooState, threshold: float = 0.3) -> chex.Array:
-        level_constants: LevelConstants = self._get_level_constants(state.current_level)
+        level_constants = self._get_state_level_constants(state)
 
         ladder_x = level_constants.ladder_positions[:, 0]
         ladder_y = level_constants.ladder_positions[:, 1]
@@ -664,7 +678,7 @@ class JaxKangaroo(JaxEnvironment[KangarooState, KangarooObservation, KangarooInf
 
     @partial(jax.jit, static_argnums=(0, 2), donate_argnums=(1,))
     def _get_y_of_platform_below_player(self, state: KangarooState, y_offset=0) -> chex.Array:
-        level_constants: LevelConstants = self._get_level_constants(state.current_level)
+        level_constants = self._get_state_level_constants(state)
 
         platform_bands: jax.Array = self._get_platforms_below_player(state, y_offset)
         platform_ys = level_constants.platform_positions[:, 1]
@@ -804,11 +818,15 @@ class JaxKangaroo(JaxEnvironment[KangarooState, KangarooObservation, KangarooInf
 
     @partial(jax.jit, static_argnums=(0,))
     def _get_level_constants(self, current_level: int) -> LevelConstants:
-        max_platforms = 20
-
-        level1_padded = self._pad_to_size(self.consts.LEVEL_1, max_platforms)
-        level2_padded = self._pad_to_size(self.consts.LEVEL_2, max_platforms)
-        level3_padded = self._pad_to_size(self.consts.LEVEL_3, max_platforms)
+        level1_padded = self._pad_to_size(
+            self.consts.LEVEL_1, LEVEL_GEOMETRY_CAPACITY
+        )
+        level2_padded = self._pad_to_size(
+            self.consts.LEVEL_2, LEVEL_GEOMETRY_CAPACITY
+        )
+        level3_padded = self._pad_to_size(
+            self.consts.LEVEL_3, LEVEL_GEOMETRY_CAPACITY
+        )
 
         return jax.lax.cond(
             current_level == 1,
@@ -822,9 +840,50 @@ class JaxKangaroo(JaxEnvironment[KangarooState, KangarooObservation, KangarooInf
             operand=None,
         )
 
+    def get_structured_level(self) -> KangarooLevel:
+        """Return all three canonical static layouts as one fixed-shape PyTree."""
+        padded_levels = tuple(
+            self._pad_to_size(level, LEVEL_GEOMETRY_CAPACITY)
+            for level in (self.consts.LEVEL_1, self.consts.LEVEL_2, self.consts.LEVEL_3)
+        )
+        return KangarooLevel(
+            ladder_positions=jnp.stack(
+                [level.ladder_positions for level in padded_levels]
+            ),
+            ladder_sizes=jnp.stack([level.ladder_sizes for level in padded_levels]),
+            platform_positions=jnp.stack(
+                [level.platform_positions for level in padded_levels]
+            ),
+            platform_sizes=jnp.stack(
+                [level.platform_sizes for level in padded_levels]
+            ),
+            fruit_positions=jnp.stack(
+                [level.fruit_positions for level in padded_levels]
+            ),
+            bell_positions=jnp.stack(
+                [level.bell_position for level in padded_levels]
+            ),
+        )
+
+    def apply_structured_level(
+        self, state: KangarooState, level: KangarooLevel
+    ) -> KangarooState:
+        """Install the current stage's static layout in a live state."""
+        stage_index = jnp.clip(state.current_level - 1, 0, 2)
+        return state.replace(
+            level=state.level.replace(
+                ladder_positions=level.ladder_positions[stage_index],
+                ladder_sizes=level.ladder_sizes[stage_index],
+                platform_positions=level.platform_positions[stage_index],
+                platform_sizes=level.platform_sizes[stage_index],
+                fruit_positions=level.fruit_positions[stage_index],
+                bell_position=level.bell_positions[stage_index],
+            )
+        )
+
     @partial(jax.jit, static_argnums=(0,), donate_argnums=(1,))
     def _player_step(self, state: KangarooState, action: chex.Array):
-        level_constants = self._get_level_constants(state.current_level)
+        level_constants = self._get_state_level_constants(state)
         x, y = state.player.x, state.player.y
         old_height = state.player.height
         old_orientation = state.player.orientation
@@ -1673,8 +1732,8 @@ class JaxKangaroo(JaxEnvironment[KangarooState, KangarooObservation, KangarooInf
     def observation_space(self) -> spaces.Dict:
         return spaces.Dict({
             "player": spaces.get_object_space(n=None, screen_size=(self.consts.SCREEN_HEIGHT, self.consts.SCREEN_WIDTH)),
-            "platforms": spaces.get_object_space(n=self.consts.MAX_PLATFORMS * 2, screen_size=(self.consts.SCREEN_HEIGHT, self.consts.SCREEN_WIDTH)), # Padded to 20
-            "ladders": spaces.get_object_space(n=self.consts.MAX_PLATFORMS * 2, screen_size=(self.consts.SCREEN_HEIGHT, self.consts.SCREEN_WIDTH)), # Padded to 20
+            "platforms": spaces.get_object_space(n=LEVEL_GEOMETRY_CAPACITY, screen_size=(self.consts.SCREEN_HEIGHT, self.consts.SCREEN_WIDTH)),
+            "ladders": spaces.get_object_space(n=LEVEL_GEOMETRY_CAPACITY, screen_size=(self.consts.SCREEN_HEIGHT, self.consts.SCREEN_WIDTH)),
             "fruits": spaces.get_object_space(n=3, screen_size=(self.consts.SCREEN_HEIGHT, self.consts.SCREEN_WIDTH)),
             "bell": spaces.get_object_space(n=None, screen_size=(self.consts.SCREEN_HEIGHT, self.consts.SCREEN_WIDTH)),
             "child": spaces.get_object_space(n=None, screen_size=(self.consts.SCREEN_HEIGHT, self.consts.SCREEN_WIDTH)),

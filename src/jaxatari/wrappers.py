@@ -242,6 +242,25 @@ class AtariWrapper(JaxatariWrapper):
         return obs, next_state, reward, terminated, truncated, info_dict
 
 
+def _contains_atari_wrapper(env: Any) -> bool:
+    """Return whether a transparent wrapper chain eventually reaches AtariWrapper."""
+    current = env
+    seen = set()
+    while isinstance(current, JaxatariWrapper) and id(current) not in seen:
+        if isinstance(current, AtariWrapper):
+            return True
+        seen.add(id(current))
+        current = current._env
+    return isinstance(current, AtariWrapper)
+
+
+def _autoreset_with_level(wrapper: JaxatariWrapper, key, env_step_args):
+    """Preserve first-class levels on SAME_STEP autoresets when requested."""
+    if getattr(wrapper._env, "uses_structured_levels", False):
+        return wrapper.reset(key, *env_step_args)
+    return wrapper.reset(key)
+
+
 @struct.dataclass
 class ObjectCentricState:
     atari_state: AtariState
@@ -256,7 +275,10 @@ class ObjectCentricWrapper(JaxatariWrapper):
 
     def __init__(self, env, frame_stack_size: int = 4, frame_skip: int = 4, clip_reward: bool = True):
         super().__init__(env)
-        assert isinstance(env, AtariWrapper), "ObjectCentricWrapper must be applied after AtariWrapper"
+        assert _contains_atari_wrapper(env), (
+            "ObjectCentricWrapper must be applied after AtariWrapper or a "
+            "transparent raw-frame wrapper around it"
+        )
         self.frame_stack_size = frame_stack_size
         self.frame_skip = frame_skip
         self.clip_reward = clip_reward
@@ -301,9 +323,9 @@ class ObjectCentricWrapper(JaxatariWrapper):
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def reset(
-            self, key: chex.PRNGKey
+            self, key: chex.PRNGKey, *env_reset_args: Any
     ) -> Tuple[chex.Array, ObjectCentricState]:
-        obs, atari_state = self._env.reset(key)
+        obs, atari_state = self._env.reset(key, *env_reset_args)
         flat_obs = self._flatten_single_obs(obs)
         obs_stack = jnp.stack([flat_obs] * self.frame_stack_size)
         return obs_stack, ObjectCentricState(atari_state, obs_stack)
@@ -313,11 +335,16 @@ class ObjectCentricWrapper(JaxatariWrapper):
             self,
             state: ObjectCentricState,
             action: int,
+            *env_step_args: Any,
     ) -> Tuple[chex.Array, ObjectCentricState, float, bool, bool, Dict[Any, Any]]:
 
         def body_fn(carry, _):
             atari_state, action = carry
-            obs, new_atari_state, reward, terminated, truncated, info = self._env.step(atari_state, action)
+            obs, new_atari_state, reward, terminated, truncated, info = self._env.step(
+                atari_state,
+                action,
+                *env_step_args,
+            )
             return (new_atari_state, action), (obs, reward, terminated, truncated, info)
 
         (atari_state, _), (obs, rewards, terminations, truncations, infos) = jax.lax.scan(
@@ -340,7 +367,7 @@ class ObjectCentricWrapper(JaxatariWrapper):
         # Autoreset (gym's SAME_STEP mode) -> reset whole stack
         obs_stack, oc_state = jax.lax.cond(
             infos["env_done"].any(),  # use actual env_done for reset condition, not affected by episodic life
-            lambda: self.reset(atari_state.key),  # reset if done, using the current key for proper random state advancement
+            lambda: _autoreset_with_level(self, atari_state.key, env_step_args),
             lambda: (obs_stack, ObjectCentricState(atari_state, obs_stack)),  # step if not done
         )
 
@@ -421,7 +448,10 @@ class PixelObsWrapper(JaxatariWrapper):
     # TODO: remove do_pixel_resize and resize whenever a different shape / grayscale is given?
     def __init__(self, env, do_pixel_resize: bool = False, pixel_resize_shape: tuple[int, int] = (84, 84), grayscale: bool = False, use_native_downscaling: bool = False, smooth_image: bool = True, frame_stack_size: int = 4, frame_skip: int = 4, max_pooling: bool = True, clip_reward: bool = True):
         super().__init__(env)
-        assert isinstance(env, AtariWrapper), "PixelObsWrapper has to be applied after AtariWrapper"
+        assert _contains_atari_wrapper(env), (
+            "PixelObsWrapper must be applied after AtariWrapper or a "
+            "transparent raw-frame wrapper around it"
+        )
         self.frame_stack_size = frame_stack_size
         self.frame_skip = frame_skip
         self.max_pooling = max_pooling
@@ -430,7 +460,7 @@ class PixelObsWrapper(JaxatariWrapper):
         self.native_downscaling = False
 
         # Access the Base Environment
-        base_env = self._env._env if isinstance(self._env, AtariWrapper) else self._env
+        base_env = _unwrap_env_chain(self._env)
 
         if do_pixel_resize and use_native_downscaling:
             # call helper from modifications to make sure that applied mods remain applied after native downscaling (lazy import to avoid circular dependency)
@@ -466,8 +496,10 @@ class PixelObsWrapper(JaxatariWrapper):
 
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, PixelState]:
-        _, atari_state = self._env.reset(key)
+    def reset(
+            self, key: chex.PRNGKey, *env_reset_args: Any
+    ) -> Tuple[chex.Array, PixelState]:
+        _, atari_state = self._env.reset(key, *env_reset_args)
         image = self._env.render(atari_state.env_state)
         processed_image = preprocess_image(self, image)
 
@@ -479,11 +511,16 @@ class PixelObsWrapper(JaxatariWrapper):
             self,
             state: PixelState,
             action: int,
+            *env_step_args: Any,
     ) -> Tuple[chex.Array, PixelState, float, bool, bool, Dict[Any, Any]]:
 
         def body_fn(carry, _):
             atari_state, action = carry
-            _, new_atari_state, reward, terminated, truncated, info = self._env.step(atari_state, action)
+            _, new_atari_state, reward, terminated, truncated, info = self._env.step(
+                atari_state,
+                action,
+                *env_step_args,
+            )
             return (new_atari_state, action), (new_atari_state.env_state, reward, terminated, truncated, info)
 
         (atari_state, _), (env_states, rewards, terminations, truncations, infos) = jax.lax.scan(
@@ -512,7 +549,7 @@ class PixelObsWrapper(JaxatariWrapper):
         # Autoreset (gym's SAME_STEP mode) -> reset whole stack
         image_stack, pixel_state = jax.lax.cond(
             infos["env_done"].any(),  # use actual env_done for reset condition, not affected by episodic life
-            lambda: self.reset(atari_state.key),
+            lambda: _autoreset_with_level(self, atari_state.key, env_step_args),
             lambda: (image_stack, PixelState(atari_state, image_stack))
         )
 
@@ -540,7 +577,10 @@ class PixelAndObjectCentricWrapper(JaxatariWrapper):
 
     def __init__(self, env, do_pixel_resize: bool = False, pixel_resize_shape: tuple[int, int] = (84, 84), grayscale: bool = False, use_native_downscaling: bool = False, smooth_image: bool = False, frame_stack_size: int = 4, frame_skip: int = 4, max_pooling: bool = True, clip_reward: bool = True):
         super().__init__(env)
-        assert isinstance(env, AtariWrapper), "PixelAndObjectCentricWrapper must be applied after AtariWrapper"
+        assert _contains_atari_wrapper(env), (
+            "PixelAndObjectCentricWrapper must be applied after AtariWrapper or "
+            "a transparent raw-frame wrapper around it"
+        )
         self.frame_stack_size = frame_stack_size
         self.frame_skip = frame_skip
         self.max_pooling = max_pooling
@@ -549,7 +589,7 @@ class PixelAndObjectCentricWrapper(JaxatariWrapper):
         self.native_downscaling = False
 
         # Access the Base Environment
-        base_env = self._env._env if isinstance(self._env, AtariWrapper) else self._env
+        base_env = _unwrap_env_chain(self._env)
 
         if do_pixel_resize and use_native_downscaling:
             # call helper from modifications to make sure that applied mods remain applied after native downscaling (lazy import to avoid circular dependency)
@@ -624,9 +664,9 @@ class PixelAndObjectCentricWrapper(JaxatariWrapper):
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def reset(
-            self, key: chex.PRNGKey
+            self, key: chex.PRNGKey, *env_reset_args: Any
     ) -> Tuple[Tuple[chex.Array, chex.Array], PixelAndObjectCentricState]:
-        obs, atari_state = self._env.reset(key)
+        obs, atari_state = self._env.reset(key, *env_reset_args)
         flat_obs = self._flatten_single_obs(obs)
         obs_stack = jnp.stack([flat_obs] * self.frame_stack_size)
 
@@ -642,10 +682,15 @@ class PixelAndObjectCentricWrapper(JaxatariWrapper):
             self,
             state: PixelAndObjectCentricState,
             action: int,
+            *env_step_args: Any,
     ) -> Tuple[Tuple[chex.Array, chex.Array], PixelAndObjectCentricState, float, bool, bool, Dict[Any, Any]]:
         def body_fn(carry, _):
             atari_state, action = carry
-            obs, new_atari_state, reward, terminated, truncated, info = self._env.step(atari_state, action)
+            obs, new_atari_state, reward, terminated, truncated, info = self._env.step(
+                atari_state,
+                action,
+                *env_step_args,
+            )
             return (new_atari_state, action), (obs, new_atari_state.env_state, reward, terminated, truncated, info)
 
         (atari_state, _), (obs, env_states, rewards, terminations, truncations, infos) = jax.lax.scan(
@@ -679,7 +724,7 @@ class PixelAndObjectCentricWrapper(JaxatariWrapper):
         # Autoreset (gym's SAME_STEP mode) -> reset whole stack
         (image_stack, obs_stack), pixel_oc_state = jax.lax.cond(
             infos["env_done"].any(),  # use actual env_done for reset condition, not affected by episodic life
-            lambda: self.reset(atari_state.key),
+            lambda: _autoreset_with_level(self, atari_state.key, env_step_args),
             lambda: ((image_stack, obs_stack), PixelAndObjectCentricState(atari_state, image_stack, obs_stack))
         )
 
@@ -700,9 +745,9 @@ class PixelAndObjectObsWrapper(PixelAndObjectCentricWrapper):
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def reset(
-            self, key: chex.PRNGKey
+            self, key: chex.PRNGKey, *env_reset_args: Any
     ) -> Tuple[Tuple[chex.Array, Any], PixelAndObjectCentricState]:
-        obs, atari_state = self._env.reset(key)
+        obs, atari_state = self._env.reset(key, *env_reset_args)
         image = self._env.render(atari_state.env_state)
         processed_image = preprocess_image(self, image)
         image_stack = jnp.stack([processed_image] * self.frame_stack_size)
@@ -720,10 +765,15 @@ class PixelAndObjectObsWrapper(PixelAndObjectCentricWrapper):
             self,
             state: PixelAndObjectCentricState,
             action: int,
+            *env_step_args: Any,
     ) -> Tuple[Tuple[chex.Array, chex.Array], PixelAndObjectCentricState, float, bool, bool, Dict[Any, Any]]:
         def body_fn(carry, _):
             atari_state, action = carry
-            obs, new_atari_state, reward, terminated, truncated, info = self._env.step(atari_state, action)
+            obs, new_atari_state, reward, terminated, truncated, info = self._env.step(
+                atari_state,
+                action,
+                *env_step_args,
+            )
             return (new_atari_state, action), (obs, new_atari_state.env_state, reward, terminated, truncated, info)
 
         (atari_state, _), (obs, env_states, rewards, terminations, truncations, infos) = jax.lax.scan(
@@ -758,7 +808,7 @@ class PixelAndObjectObsWrapper(PixelAndObjectCentricWrapper):
         # Autoreset (gym's SAME_STEP mode) -> reset whole stack
         (image_stack, obs_stack), pixel_oc_state = jax.lax.cond(
             infos["env_done"].any(),
-            lambda: self.reset(atari_state.key),
+            lambda: _autoreset_with_level(self, atari_state.key, env_step_args),
             lambda: ((image_stack, obs_stack), PixelAndObjectCentricState(atari_state, image_stack, obs_stack)),
         )
 
@@ -818,8 +868,10 @@ class FlattenObservationWrapper(JaxatariWrapper):
         return jax.tree.map(flatten_and_cast, obs_tree)
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def reset(self, key: chex.PRNGKey) -> Tuple[chex.ArrayTree, Any]:
-        obs, state = self._env.reset(key)
+    def reset(
+            self, key: chex.PRNGKey, *env_reset_args: Any
+    ) -> Tuple[chex.ArrayTree, Any]:
+        obs, state = self._env.reset(key, *env_reset_args)
         processed_obs = self._process_obs(obs)
         return processed_obs, state # State can be passed through directly
 
@@ -828,8 +880,13 @@ class FlattenObservationWrapper(JaxatariWrapper):
             self,
             state: Any,
             action: int,
+            *env_step_args: Any,
     ) -> Tuple[chex.ArrayTree, Any, float, bool, bool, Dict[str, Any]]:
-        obs, next_state, reward, terminated, truncated, info = self._env.step(state, action)
+        obs, next_state, reward, terminated, truncated, info = self._env.step(
+            state,
+            action,
+            *env_step_args,
+        )
         processed_obs = self._process_obs(obs)
         return processed_obs, next_state, reward, terminated, truncated, info
 
@@ -923,8 +980,10 @@ class NormalizeObservationWrapper(JaxatariWrapper):
         return jax.tree.unflatten(jax.tree.structure(obs), normalized_leaves)
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def reset(self, key: chex.PRNGKey) -> Tuple[chex.ArrayTree, Any]:
-        obs, state = self._env.reset(key)
+    def reset(
+            self, key: chex.PRNGKey, *env_reset_args: Any
+    ) -> Tuple[chex.ArrayTree, Any]:
+        obs, state = self._env.reset(key, *env_reset_args)
         normalized_obs = self._normalize_obs(obs)
         return normalized_obs, state
 
@@ -933,8 +992,13 @@ class NormalizeObservationWrapper(JaxatariWrapper):
             self,
             state: Any,
             action: int,
+            *env_step_args: Any,
     ) -> Tuple[chex.ArrayTree, Any, float, bool, bool, Dict[str, Any]]:
-        obs, next_state, reward, terminated, truncated, info = self._env.step(state, action)
+        obs, next_state, reward, terminated, truncated, info = self._env.step(
+            state,
+            action,
+            *env_step_args,
+        )
         normalized_obs = self._normalize_obs(obs)
         return normalized_obs, next_state, reward, terminated, truncated, info
 
@@ -954,9 +1018,9 @@ class LogWrapper(JaxatariWrapper):
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def reset(
-            self, key: chex.PRNGKey
+            self, key: chex.PRNGKey, *env_reset_args: Any
     ) -> Tuple[chex.Array, LogState]:
-        obs, atari_state = self._env.reset(key)
+        obs, atari_state = self._env.reset(key, *env_reset_args)
         state = LogState(atari_state, 0.0, 0, 0.0, 0)
         return obs, state
 
@@ -965,8 +1029,13 @@ class LogWrapper(JaxatariWrapper):
             self,
             state: LogState,
             action: int,
+            *env_step_args: Any,
     ) -> Tuple[chex.Array, LogState, float, bool, bool, Dict[Any, Any]]:
-        obs, atari_state, reward, terminated, truncated, info = self._env.step(state.atari_state, action)
+        obs, atari_state, reward, terminated, truncated, info = self._env.step(
+            state.atari_state,
+            action,
+            *env_step_args,
+        )
         # use env_reward (unclipped/unchanged) for logging when available
         new_episode_return = state.episode_returns + info.get("env_reward", reward)
         new_episode_length = state.episode_lengths + 1
@@ -1008,11 +1077,13 @@ class MultiRewardLogWrapper(JaxatariWrapper):
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def reset(
-            self, key: chex.PRNGKey,
+            self, key: chex.PRNGKey, *env_reset_args: Any,
     ) -> Tuple[chex.Array, MultiRewardLogState]:
-        obs, atari_state = self._env.reset(key)
+        obs, atari_state = self._env.reset(key, *env_reset_args)
         # Dummy step to get info structure
-        _, _, _, _, _, dummy_info = self._env.step(atari_state, 0)
+        _, _, _, _, _, dummy_info = self._env.step(
+            atari_state, 0, *env_reset_args
+        )
         rewards_shape_provider = dummy_info.get("all_rewards", jnp.zeros(1))
         episode_returns_init = jnp.zeros_like(rewards_shape_provider)
         state = MultiRewardLogState(atari_state, 0.0, episode_returns_init, 0, 0.0, episode_returns_init, 0)
@@ -1023,8 +1094,11 @@ class MultiRewardLogWrapper(JaxatariWrapper):
             self,
             state: MultiRewardLogState,
             action: int,
+            *env_step_args: Any,
     ) -> Tuple[chex.Array, MultiRewardLogState, float, bool, bool, Dict[Any, Any]]:
-        obs, atari_state, reward, terminated, truncated, info = self._env.step(state.atari_state, action)
+        obs, atari_state, reward, terminated, truncated, info = self._env.step(
+            state.atari_state, action, *env_step_args
+        )
         new_episode_return_env = state.episode_returns_env + info.get("env_reward", reward)
         all_rewards_step = info.get("all_rewards", jnp.zeros_like(state.episode_returns))
         new_episode_return = state.episode_returns + all_rewards_step
@@ -1514,8 +1588,8 @@ class AccelDeltaModWrapper(JaxatariWrapper):
             self._parameter_bin_counts = jnp.asarray(
                 [values.size for values in self._parameter_values], dtype=jnp.int32
             )
-            # Delta dimensions are neutral at multiplier 1. Geometry and AI
-            # dimensions are neutral at their raw Pong baseline constants.
+            # Delta dimensions are neutral at multiplier 1. Pre-step state
+            # dimensions are neutral at their raw game baseline constants.
             baseline_values = [1.0] * len(self._delta_specs) + [
                 float(self._resolve_const(spec.baseline_const))
                 for spec in self._pre_step_specs
@@ -1538,7 +1612,7 @@ class AccelDeltaModWrapper(JaxatariWrapper):
 
     @property
     def parameter_baseline_level(self):
-        """Integer level vector whose decoded values reproduce base Pong."""
+        """Integer level vector whose decoded values reproduce the base game."""
         return self._parameter_baseline_level
 
     def decode_parameter_level(self, level):
@@ -1613,7 +1687,9 @@ class AccelDeltaModWrapper(JaxatariWrapper):
         """
         Builds a function (pre_core_state, post_core_state, strength) ->
         new_post_core_state that amplifies ONLY the physics-caused delta
-        of spec.target, by `strength`, then clamps to spec's bounds.
+        of spec.target, by `strength`, then clamps to spec's bounds.  A unit
+        strength returns the unmodified post-physics state exactly, so the
+        wrapper's baseline remains identical to the base game.
 
         Note: spec.op / spec.value / spec.factor are NOT used here -- this
         is a deliberate departure from GenericModSpec's normal meaning.
@@ -1635,6 +1711,9 @@ class AccelDeltaModWrapper(JaxatariWrapper):
             None if spec.max_abs_delta is None else jnp.asarray(spec.max_abs_delta)
         )
         dtype = spec.dtype
+        integer_dtype = (
+            dtype is not None and np.issubdtype(np.dtype(dtype), np.integer)
+        )
 
         def _apply(pre_core_state, post_core_state, strength):
             pre_val = self._resolve_path(pre_core_state, target_path)
@@ -1677,9 +1756,26 @@ class AccelDeltaModWrapper(JaxatariWrapper):
             amplified = clamp_fn(amplified)
 
             if dtype is not None:
+                # Integer-valued positions must round the accelerated raw-frame
+                # displacement. A direct cast truncates both +1.75 and -1.75
+                # to +/-1, silently turning most integer-position multipliers into
+                # no-ops.
+                if integer_dtype:
+                    amplified = jnp.rint(amplified)
                 amplified = amplified.astype(dtype)
 
-            return self._set_path(post_core_state, target_path, amplified)
+            modified_core = self._set_path(
+                post_core_state, target_path, amplified
+            )
+            # Do not let an ACCEL wrapper with a neutral multiplier alter the
+            # base game through a bound or dtype conversion. In particular, the
+            # velocity cap is an opt-in scaling safeguard, not core physics.
+            return jax.lax.cond(
+                jnp.equal(strength, 1.0),
+                lambda _: post_core_state,
+                lambda _: modified_core,
+                operand=None,
+            )
 
         return _apply
 
@@ -1751,7 +1847,7 @@ class AccelDeltaModWrapper(JaxatariWrapper):
         return _apply
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def _apply_pre_step_mods(self, state, level_mask):
+    def _apply_pre_step_mods(self, state, level_mask, strength=1.0):
         """Apply active non-compounding state specs before base physics."""
         if not self._pre_step_appliers:
             return state
@@ -1901,7 +1997,7 @@ class AccelDeltaModWrapper(JaxatariWrapper):
             pre_step_state = self._apply_pre_step_parameters(state, parameter_values)
         else:
             level_mask = jnp.asarray(level_mask, dtype=bool)
-            pre_step_state = self._apply_pre_step_mods(state, level_mask)
+            pre_step_state = self._apply_pre_step_mods(state, level_mask, strength)
         obs, post_state, reward, terminated, truncated, info = self._env.step(
             pre_step_state, base_action
         )
@@ -1918,6 +2014,16 @@ class AccelDeltaModWrapper(JaxatariWrapper):
                 strength,
             )
 
+        # When ACCEL sits directly above AtariWrapper, downstream frame-skip
+        # wrappers consume this single-frame observation. Rebuild it from the
+        # modified state so the agent sees the accelerated position/geometry
+        # that will actually be used on the following raw frame.
+        if isinstance(self._env, AtariWrapper) and hasattr(
+            self._core_env, "_get_observation"
+        ):
+            obs = self._core_env._get_observation(
+                _get_core_env_state(modified_state)
+            )
 
         info_dict = dict(info) if not hasattr(info, "_asdict") else dict(info._asdict())
         if self._level_encoding == "parameter_vector":

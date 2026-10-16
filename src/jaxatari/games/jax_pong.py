@@ -31,6 +31,23 @@ def _get_default_asset_config() -> tuple:
 class PongConstants(struct.PyTreeNode):
     # Static Configuration (Integers/Tuples) -> pytree_node=False
     ENEMY_STEP_SIZE: int = struct.field(pytree_node=False, default=2)
+    # 0 tracks the ball continuously; 1 tracks only while the ball travels
+    # toward the enemy, matching the built-in lazy_enemy behavior.
+    ENEMY_TRACKING_MODE: int = struct.field(pytree_node=False, default=0)
+    ENEMY_TRACKING_MODE_MIN: int = struct.field(pytree_node=False, default=0)
+    ENEMY_TRACKING_MODE_MAX: int = struct.field(pytree_node=False, default=1)
+    # Zero preserves the native schedule (skip every eighth raw frame).
+    # Positive values instead move the enemy only on every Nth raw frame.
+    ENEMY_MOVE_INTERVAL: int = struct.field(pytree_node=False, default=0)
+    ENEMY_MOVE_INTERVAL_MIN: int = struct.field(pytree_node=False, default=0)
+    ENEMY_MOVE_INTERVAL_MAX: int = struct.field(pytree_node=False, default=8)
+    # When enabled, an incoming ball makes the enemy visibly accelerate toward
+    # its collision-aligned intercept point and overrides selected slow enemy
+    # settings when needed.
+    ENEMY_MATCH_BALL_SPEED: bool = struct.field(pytree_node=False, default=False)
+    # Off by default so the unwrapped game keeps the reference Pong serve
+    # direction.  The ACCEL wrapper may opt in through its experiment config.
+    RANDOMIZE_SERVE_DIRECTION: bool = struct.field(pytree_node=False, default=False)
     WIDTH: int = struct.field(pytree_node=False, default=160)
     HEIGHT: int = struct.field(pytree_node=False, default=210)
     BASE_BALL_SPEED: float = struct.field(pytree_node=False, default=1)
@@ -85,8 +102,17 @@ class PongState(struct.PyTreeNode):
     enemy_y: chex.Array
     enemy_speed: chex.Array
     enemy_step_size: chex.Array
+    enemy_tracking_mode: chex.Array
+    enemy_move_interval: chex.Array
     ball_vel_x: chex.Array
     ball_vel_y: chex.Array
+    # ACCEL trajectory modifiers keep the physical velocity unchanged and
+    # instead scale the ball's position delta after a raw Pong step.  These
+    # fields carry that effective delta solely for ENEMY_MATCH_BALL_SPEED; they
+    # do not change the base game's ball physics.
+    enemy_response_ball_vel_x: chex.Array
+    enemy_response_ball_vel_y: chex.Array
+    enemy_response_uses_accel_trajectory: chex.Array
     player_score: chex.Array
     enemy_score: chex.Array
     step_counter: chex.Array
@@ -293,20 +319,6 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
             -ball_vel_x,
             ball_vel_x,
         )
-        # The reference Pong constants define a maximum ball speed of four.
-        # Clamp the core dynamics as well as the ACCEL wrapper so a sequence
-        # of boosted paddle hits cannot silently exceed that physical limit.
-        ball_vel_x = jnp.clip(
-            ball_vel_x,
-            -self.consts.MAX_BALL_SPEED,
-            self.consts.MAX_BALL_SPEED,
-        )
-        ball_vel_y = jnp.clip(
-            ball_vel_y,
-            -self.consts.MAX_BALL_SPEED,
-            self.consts.MAX_BALL_SPEED,
-        )
-
         return state.replace(
             ball_x=ball_x.astype(jnp.int32),
             ball_y=ball_y.astype(jnp.int32),
@@ -315,15 +327,116 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
         )
 
     def _enemy_step(self, state: PongState) -> PongState:
-        should_move = state.step_counter % 8 != 0
+        approach_only = state.enemy_tracking_mode == 1
+        tracking_enabled = (~approach_only) | (state.ball_vel_x < 0)
+        native_schedule = state.step_counter % 8 != 0
+        safe_interval = jnp.maximum(state.enemy_move_interval, 1)
+        interval_schedule = state.step_counter % safe_interval == 0
+        scheduled_move = jnp.where(
+            state.enemy_move_interval > 0,
+            interval_schedule,
+            native_schedule,
+        )
+        should_move = scheduled_move & tracking_enabled
         direction = jnp.sign(state.ball_y - state.enemy_y)
         new_y = state.enemy_y + (direction * state.enemy_step_size).astype(jnp.int32)
+
+        enemy_speed = state.enemy_speed
+        if self.consts.ENEMY_MATCH_BALL_SPEED:
+            response_ball_vel_x = jnp.where(
+                state.enemy_response_uses_accel_trajectory,
+                state.enemy_response_ball_vel_x,
+                state.ball_vel_x,
+            )
+            response_ball_vel_y = jnp.where(
+                state.enemy_response_uses_accel_trajectory,
+                state.enemy_response_ball_vel_y,
+                state.ball_vel_y,
+            )
+            ball_speed = jnp.maximum(
+                jnp.abs(response_ball_vel_x),
+                jnp.abs(response_ball_vel_y),
+            )
+            incoming_ball = response_ball_vel_x < 0
+            # A selected slow enemy must not defeat the run-wide match-speed
+            # safety rule merely because a small ACCEL position multiplier
+            # rounds back to a one-pixel raw Pong movement.
+            slow_enemy = (state.enemy_move_interval > 1) | (
+                state.enemy_step_size < self.consts.ENEMY_STEP_SIZE
+            )
+            incoming_ball_needs_match = incoming_ball & (
+                (ball_speed > self.consts.BASE_BALL_SPEED) | slow_enemy
+            )
+            # The core moves the enemy before the ball.  Aim at the centre of
+            # the ball's *effective* next position, so the target agrees with
+            # the accelerated trajectory rendered after this raw Pong step.
+            intercept_y = jnp.clip(
+                state.ball_y
+                + response_ball_vel_y
+                - self.consts.ENEMY_SIZE[1] / 2,
+                self.consts.PADDLE_MIN_Y,
+                self.consts.PADDLE_MAX_Y,
+            ).astype(jnp.int32)
+
+            # Scale the normal tracking step by the incoming ball's effective
+            # speed.  This is deliberately a movement speed, not an immediate
+            # teleport: accelerated training clips now show the enemy paddle
+            # moving faster as it chases the ball.  Estimate the remaining
+            # horizontal travel too; if proportional speed alone would arrive
+            # late, raise it just enough to reach the intercept in time.
+            enemy_right_x = self.consts.ENEMY_X + self.consts.ENEMY_SIZE[0] - 1
+            horizontal_distance = jnp.maximum(state.ball_x - enemy_right_x, 0)
+            frames_to_intercept = jnp.maximum(
+                jnp.ceil(
+                    horizontal_distance.astype(jnp.float32)
+                    / jnp.maximum(jnp.abs(response_ball_vel_x), 1.0)
+                ).astype(jnp.int32),
+                1,
+            )
+            intercept_delta = intercept_y - state.enemy_y
+            # Matching restores at least the native two-pixel enemy step, so
+            # the selected step-size slowdown is bypassed as well as cadence.
+            match_base_step = jnp.maximum(
+                state.enemy_step_size,
+                self.consts.ENEMY_STEP_SIZE,
+            )
+            speed_matched_step = jnp.ceil(
+                match_base_step.astype(jnp.float32)
+                * ball_speed
+                / self.consts.BASE_BALL_SPEED
+            ).astype(jnp.int32)
+            required_step = jnp.ceil(
+                jnp.abs(intercept_delta).astype(jnp.float32)
+                / frames_to_intercept.astype(jnp.float32)
+            ).astype(jnp.int32)
+            catch_up_step = jnp.maximum(
+                match_base_step,
+                jnp.maximum(speed_matched_step, required_step),
+            )
+            catch_up_move = jnp.sign(intercept_delta) * jnp.minimum(
+                jnp.abs(intercept_delta), catch_up_step
+            )
+            catch_up_y = jnp.clip(
+                state.enemy_y + catch_up_move,
+                self.consts.PADDLE_MIN_Y,
+                self.consts.PADDLE_MAX_Y,
+            ).astype(jnp.int32)
+            new_y = jnp.where(incoming_ball_needs_match, catch_up_y, new_y)
+            should_move = should_move | incoming_ball_needs_match
+            enemy_speed = jnp.where(
+                incoming_ball_needs_match,
+                catch_up_y - state.enemy_y,
+                state.enemy_speed,
+            ).astype(jnp.int32)
 
         enemy_y = jax.lax.cond(
             should_move, lambda _: new_y, lambda _: state.enemy_y, operand=None
         )
 
-        return state.replace(enemy_y=enemy_y.astype(jnp.int32))
+        return state.replace(
+            enemy_y=enemy_y.astype(jnp.int32),
+            enemy_speed=enemy_speed,
+        )
 
     def _score_and_reset(self, state: PongState) -> PongState:
         player_goal = state.ball_x < 4
@@ -401,11 +514,21 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
     def _reset_ball_after_goal(self, state_and_goal: Tuple[PongState, bool]) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
         state, scored_right = state_and_goal
 
-        ball_vel_y = jnp.where(
-            state.ball_y > self.consts.BALL_START_Y,
-            1,
-            -1,
-        ).astype(jnp.float32)
+        if self.consts.RANDOMIZE_SERVE_DIRECTION:
+            # ``state.key`` is a dedicated serve key prepared by ``step``.
+            ball_vel_y = jnp.where(
+                jax.random.bernoulli(state.key),
+                1.0,
+                -1.0,
+            ).astype(jnp.float32)
+        else:
+            # Match the reference game: use the previous ball's vertical half
+            # of the court to choose the next vertical direction.
+            ball_vel_y = jnp.where(
+                state.ball_y > self.consts.BALL_START_Y,
+                1.0,
+                -1.0,
+            ).astype(jnp.float32)
 
         ball_vel_x = jnp.where(
             scored_right, 1, -1
@@ -419,8 +542,19 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
         )
 
     def reset(self, key: chex.PRNGKey = jax.random.PRNGKey(42)) -> Tuple[PongObservation, PongState]:
-        # Split key for env reset if needed and for state storage
-        state_key, _step_key = jax.random.split(key)
+        # Keep the future state RNG independent from the optional initial serve
+        # draw.  The first split output is unchanged from reference Pong.
+        state_key, serve_key = jax.random.split(key)
+        if self.consts.RANDOMIZE_SERVE_DIRECTION:
+            initial_ball_vel_y = jnp.where(
+                jax.random.bernoulli(serve_key),
+                1.0,
+                -1.0,
+            ).astype(jnp.float32)
+        else:
+            initial_ball_vel_y = jnp.asarray(
+                self.consts.BALL_SPEED[1], dtype=jnp.float32
+            )
         state = PongState(
             player_y=jnp.array(96.0, dtype=jnp.float32),
             player_speed=jnp.array(0.0, dtype=jnp.float32),
@@ -437,8 +571,21 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
             enemy_y=jnp.array(115).astype(jnp.int32),
             enemy_speed=jnp.array(0.0).astype(jnp.int32),
             enemy_step_size=jnp.array(self.consts.ENEMY_STEP_SIZE).astype(jnp.int32),
+            enemy_tracking_mode=jnp.array(
+                self.consts.ENEMY_TRACKING_MODE,
+                dtype=jnp.int32,
+            ),
+            enemy_move_interval=jnp.array(
+                self.consts.ENEMY_MOVE_INTERVAL,
+                dtype=jnp.int32,
+            ),
             ball_vel_x=jnp.array(self.consts.BALL_SPEED[0]).astype(jnp.float32),
-            ball_vel_y=jnp.array(self.consts.BALL_SPEED[1]).astype(jnp.float32),
+            ball_vel_y=initial_ball_vel_y,
+            enemy_response_ball_vel_x=jnp.array(
+                self.consts.BALL_SPEED[0], dtype=jnp.float32
+            ),
+            enemy_response_ball_vel_y=initial_ball_vel_y,
+            enemy_response_uses_accel_trajectory=jnp.array(False),
             player_score=jnp.array(0).astype(jnp.int32),
             enemy_score=jnp.array(0).astype(jnp.int32),
             step_counter=jnp.array(0).astype(jnp.int32),
@@ -457,10 +604,13 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
         state = self._player_step(state, atari_action)
         state = self._enemy_step(state)
         state = self._ball_step(state, atari_action)
+        # Reserve one subkey for an optional post-point randomized serve and
+        # carry the other into the next step. With that option disabled this
+        # advances the key exactly as the reference game does.
+        serve_key, next_rng = jax.random.split(state.key)
+        state = state.replace(key=serve_key)
         state = self._score_and_reset(state)
 
-        # Advance the RNG key for the next step (modifications may have already updated it)
-        _, next_rng = jax.random.split(state.key)
         state = state.replace(key=next_rng)
 
         done = self._get_done(state)
