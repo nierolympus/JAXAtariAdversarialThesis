@@ -1,0 +1,65 @@
+# Object-centric Freeway ACCEL with explicit car dynamics and geometry levels.
+
+ALG_NAME: "pqn_jaxued_accel"
+NAME: "freeway_object_accel27_20m"
+TOTAL_TIMESTEPS: 20000000
+TOTAL_TIMESTEPS_DECAY: 20000000
+NUM_ENVS: 128
+NUM_STEPS: 128
+EPS_START: 1.0
+EPS_FINISH: 0.02
+EPS_DECAY: 0.5
+NUM_EPOCHS: 5
+NUM_MINIBATCHES: 32
+NORM_TYPE: "layer_norm"
+LR: 2.25e-4
+LR_LINEAR_DECAY: true
+MAX_GRAD_NORM: 10
+GAMMA: 0.99
+LAMBDA: 0.65
+
+ENV_NAME: "freeway"
+ADV_WRAPPER: "freeway"
+OBJECT_CENTRIC: true
+TRAIN_MODS: null
+JAXUED_ALG: "accel"
+
+# Three independently mutable parameters. The Cartesian product contains
+# 3 * 3 * 3 = 27 levels, including exact base Freeway [1.0, 8, 10].
+ACCEL_LEVEL_ENCODING: "parameter_vector"
+ACCEL_PARAMETER_CAR_SPEED_MULTIPLIERS: [1.0, 1.5, 2.0]
+ACCEL_PARAMETER_CAR_WIDTHS: [8, 10, 12]
+ACCEL_PARAMETER_CAR_HEIGHTS: [10, 12, 14]
+ACCEL_BUFFER_CAPACITY: 27
+ACCEL_PARAMETER_BASELINE_PROB: 0.70
+ACCEL_MUTATION_PROB: 0.60
+ACCEL_MUTATION_MULTI_PARAM_PROB: 0.05
+
+REPLAY_PROB: 0.70
+STALENESS_COEFF: 0.35
+MINIMUM_FILL_RATIO: 0.35
+TEMPERATURE: 1.0
+JAXUED_SCORE_FUNCTION: "q_pvl"
+EXPLORATORY_GRAD_UPDATES: true
+BUFFER_DUPLICATE_CHECK: true
+
+# The runner always evaluates base first, followed by these two fixed mods.
+EVAL_DURING_TRAINING: true
+EVAL_EVERY_STEPS: 1000000
+EVAL_NUM_ENVS: 128
+EVAL_NUM_STEPS: 10000
+EVAL_SEED: 20261014
+FINAL_EVAL: true
+EVAL_MODS: ["slow_cars", "stop_all_cars"]
+EVAL_RECORD_VIDEO: true
+EVAL_VIDEO_BASE: true
+EVAL_VIDEO_MODS: true
+TRAIN_RECORD_ACCEL_VIDEO: true
+
+HYP_TUNE: false
+ENTITY: null
+PROJECT: "Thesis"
+WANDB_MODE: "online"
+SAVE_PATH: null
+SEED: 42
+NUM_SEEDS: 1

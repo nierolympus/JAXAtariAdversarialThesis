@@ -1,0 +1,67 @@
+# Pixel-observation counterpart of the Seaquest 32-level mild profile.
+# Its full hyperparameter and physics profile matches the object version;
+# only the observation pipeline differs.
+
+TOTAL_TIMESTEPS: 15000000
+TOTAL_TIMESTEPS_DECAY: 15000000
+NUM_ENVS: 120
+NUM_STEPS: 120
+EPS_START: 0.98
+EPS_FINISH: 0.025
+EPS_DECAY: 0.45
+NUM_EPOCHS: 4
+NUM_MINIBATCHES: 30
+NORM_TYPE: "batch_norm"
+LR: 2.0e-4
+LR_LINEAR_DECAY: false
+MAX_GRAD_NORM: 9
+GAMMA: 0.985
+LAMBDA: 0.60
+
+ENV_NAME: "seaquest"
+ADV_WRAPPER: "seaquest"
+OBJECT_CENTRIC: false
+PIXEL_GRAYSCALE: true
+PIXEL_RESIZE: true
+PIXEL_RESIZE_SHAPE: [84, 84]
+USE_NATIVE_DOWNSCALING: true
+JAXUED_ALG: "accel"
+PROFILE: "mild"
+
+# The same 32 exact Seaquest physics levels used by the object runs.
+ACCEL_LEVEL_ENCODING: "parameter_vector"
+ACCEL_PARAMETER_PLAYER_MOVE_SPEEDS: [1, 3]
+ACCEL_PARAMETER_ENEMY_SPEED_MULTIPLIERS: [1, 3]
+ACCEL_PARAMETER_PLAYER_MISSILE_SPEEDS: [2, 4, 5, 7]
+ACCEL_PARAMETER_ENEMY_MISSILE_SPEED_MULTIPLIERS: [1, 3]
+ACCEL_BUFFER_CAPACITY: 32
+
+# Mild full-profile perturbation of the best-Pong curriculum schedule.
+ACCEL_PARAMETER_BASELINE_PROB: 0.65
+ACCEL_MUTATION_PROB: 0.55
+ACCEL_MUTATION_MULTI_PARAM_PROB: 0.08
+REPLAY_PROB: 0.65
+STALENESS_COEFF: 0.30
+MINIMUM_FILL_RATIO: 0.30
+TEMPERATURE: 0.90
+JAXUED_SCORE_FUNCTION: "q_pvl"
+EXPLORATORY_GRAD_UPDATES: true
+
+# Identical base-Seaquest and gravity evaluation suite.
+EVAL_DURING_TRAINING: true
+EVAL_EVERY_STEPS: 1000000
+EVAL_NUM_ENVS: 128
+EVAL_NUM_STEPS: 10000
+FINAL_EVAL: true
+EVAL_MODS: ["gravity"]
+EVAL_RECORD_VIDEO: true
+EVAL_VIDEO_BASE: true
+EVAL_VIDEO_MODS: true
+TRAIN_RECORD_ACCEL_VIDEO: true
+
+HYP_TUNE: false
+ENTITY: null
+PROJECT: "Thesis"
+WANDB_MODE: "online"
+SEED: 42
+NUM_SEEDS: 1
