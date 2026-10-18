@@ -1,10 +1,11 @@
-# Plain Seaquest PQN baseline with the same protagonist settings and
-# base/gravity evaluation suite as the ACCEL comparison runs.
+# Plain Seaquest PQN baseline with no ACCEL wrapper or curriculum. The ordinary
+# PQN runner still applies LogWrapper and uses its step-based W&B evaluation and
+# video callbacks for base plus the same robustness-mod suite as ACCEL runs.
 
 ALG_NAME: "pqn"
-NAME: "seaquest_base_object_eval"
-TOTAL_TIMESTEPS: 15000000
-TOTAL_TIMESTEPS_DECAY: 15000000
+NAME: "seaquest_object_base_eval_20m"
+TOTAL_TIMESTEPS: 20000000
+TOTAL_TIMESTEPS_DECAY: 20000000
 NUM_ENVS: 128
 NUM_STEPS: 128
 EPS_START: 1.0
@@ -32,8 +33,11 @@ EVAL_NUM_STEPS: 10000
 EVAL_SEED: 20261012
 EPS_TEST: 0.0
 FINAL_EVAL: true
-EVAL_MODS: ["gravity"]
+EVAL_MODS: ["vertical_oscillation", "faster_enemies", "continuous_random_spawns"]
 EVAL_RECORD_VIDEO: true
 EVAL_VIDEO_BASE: true
 EVAL_VIDEO_MODS: true
-RECORD_FINAL_VIDEO: true
+EVAL_VIDEO_MAX_STEPS: 1000
+EVAL_VIDEO_FPS: 30
+# FINAL_EVAL already writes video/final/* through the shared W&B video logger.
+RECORD_FINAL_VIDEO: false

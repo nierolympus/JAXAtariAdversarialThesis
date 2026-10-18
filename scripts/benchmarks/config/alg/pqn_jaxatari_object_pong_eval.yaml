@@ -1,5 +1,5 @@
-# Plain object-centric Pong baseline with the same base/lazy-enemy evaluation
-# suite and protagonist settings as the corresponding ACCEL comparison.
+# Plain object-centric Pong baseline with the same three held-out mod
+# evaluations and protagonist settings as the ACCEL comparison.
 
 ALG_NAME: "pqn"
 NAME: "pong_object_base_eval"
@@ -31,10 +31,11 @@ EVAL_NUM_STEPS: 10000
 EVAL_SEED: 20261011
 EPS_TEST: 0.0
 FINAL_EVAL: true
-EVAL_MODS: ["lazy_enemy"]
+EVAL_MODS: ["lazy_enemy", "random_enemy", "linear_movement"]
 EVAL_RECORD_VIDEO: true
 EVAL_VIDEO_BASE: true
 EVAL_VIDEO_MODS: true
 EVAL_VIDEO_MAX_STEPS: 1000
 EVAL_VIDEO_FPS: 30
-RECORD_FINAL_VIDEO: true
+# FINAL_EVAL already logs video/final/* through the shared W&B video callback.
+RECORD_FINAL_VIDEO: false

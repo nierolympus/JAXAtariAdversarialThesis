@@ -8,6 +8,114 @@ import wandb
 from safetensors.flax import save_file, load_file
 from flax.traverse_util import flatten_dict, unflatten_dict
 
+
+def log_wandb_video(
+    frames,
+    label,
+    env_step,
+    fps=30,
+    caption=None,
+    total_reward=None,
+    metrics_payload=None,
+):
+    """Log one rollout using the shared ACCEL/non-ACCEL W&B schema."""
+    frames = np.asarray(frames, dtype=np.uint8)
+    if frames.ndim == 3:
+        frames = frames[..., None]
+    if frames.ndim != 4:
+        raise ValueError(
+            f"Expected video frames shaped (T, H, W, C), got {frames.shape}."
+        )
+    if frames.shape[-1] == 1:
+        frames = np.repeat(frames, 3, axis=-1)
+    elif frames.shape[-1] >= 3:
+        frames = frames[..., :3]
+    else:
+        raise ValueError(
+            "Video frames must have one or at least three channels, "
+            f"got {frames.shape}."
+        )
+
+    host_step = int(np.asarray(env_step))
+    video_payload = {
+        "num_env_steps": host_step,
+        f"video/{label}": wandb.Video(
+            np.transpose(frames, (0, 3, 1, 2)),
+            fps=fps,
+            format="mp4",
+            caption=caption,
+        ),
+    }
+    shared_metrics = dict(metrics_payload or {})
+    shared_metrics["num_env_steps"] = host_step
+    shared_metrics.setdefault(f"video_metrics/{label}/length", len(frames))
+    if total_reward is not None:
+        shared_metrics.setdefault(
+            f"video_metrics/{label}/return", float(total_reward)
+        )
+
+    wandb.log(video_payload, step=host_step)
+    wandb.log(shared_metrics, step=host_step)
+
+
+def evaluation_video_callback(
+    states,
+    dones,
+    rewards,
+    step,
+    periodic_due,
+    final_due,
+    *,
+    renderer,
+    eval_label,
+    eval_every_steps,
+    fps=30,
+):
+    """Render a plain-PQN eval rollout with the ACCEL W&B video layout."""
+    print("Rendering evaluation video...")
+    while True:
+        if hasattr(states, "atari_state"):
+            states = states.atari_state
+        elif hasattr(states, "env_state"):
+            states = states.env_state
+        else:
+            break
+
+    done_values = np.asarray(dones, dtype=bool).reshape(-1)
+    done_indices = np.flatnonzero(done_values)
+    available_states = jax.tree_util.tree_leaves(states)[0].shape[0]
+    num_states = (
+        int(done_indices[0]) + 1 if len(done_indices) else int(available_states)
+    )
+    if num_states <= 0:
+        return
+
+    states = jax.tree_util.tree_map(lambda value: value[:num_states], states)
+    frames = np.asarray(jax.vmap(renderer.render)(states), dtype=np.uint8)
+    total_reward = float(
+        np.asarray(rewards, dtype=np.float32).reshape(-1)[:num_states].sum()
+    )
+    host_step = int(np.asarray(step))
+    safe_label = str(eval_label).replace("/", "_").replace(" ", "_")
+    video_prefixes = []
+    if bool(np.asarray(periodic_due)):
+        evaluation_index = max(1, host_step // max(int(eval_every_steps), 1))
+        video_prefixes.append(f"eval_{evaluation_index:03d}")
+    if bool(np.asarray(final_due)):
+        video_prefixes.append("final")
+
+    for prefix in video_prefixes:
+        log_wandb_video(
+            frames,
+            label=f"{prefix}/{safe_label}",
+            env_step=host_step,
+            fps=fps,
+            caption="Evaluation rollout without an ACCEL level.",
+            total_reward=total_reward,
+        )
+    print("Evaluation video done.")
+
+
 def video_callback(
     states,
     dones,

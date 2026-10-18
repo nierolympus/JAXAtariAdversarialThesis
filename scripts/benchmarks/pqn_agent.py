@@ -27,7 +27,7 @@ from omegaconf import OmegaConf
 import jaxatari
 import wandb
 
-from train_utils import video_callback, save_params
+from train_utils import evaluation_video_callback, save_params
 
 class CNN(nn.Module):
 
@@ -540,7 +540,12 @@ def make_train(config):
                 current_eval_metrics = eval_metrics_state[index]
                 current_eval_metrics = jax.lax.cond(
                     eval_due,
-                    lambda key: eval_fn(train_state, key),
+                    lambda key: eval_fn(
+                        train_state,
+                        key,
+                        periodic_eval_due,
+                        final_eval_due,
+                    ),
                     lambda _: current_eval_metrics,
                     eval_rng,
                 )
@@ -612,7 +617,7 @@ def make_train(config):
             return runner_state, metrics
         
         def _build_eval_fn(label, eval_env, eval_renderer, is_mod):
-            def _evaluate(train_state, rng):
+            def _evaluate(train_state, rng, periodic_video_due, final_video_due):
                 if eval_seed is not None:
                     # Common random numbers make base/ACCEL evaluation curves
                     # directly comparable at every checkpoint.
@@ -644,10 +649,12 @@ def make_train(config):
                     done = jnp.logical_or(terminated, truncated)
                     env_state_vid = jax.tree.map(lambda x: x[0], new_env_state)
                     dones_vid = jax.tree.map(lambda x: x[0], done)
+                    rewards_vid = reward[0]
                     return (new_env_state, new_obs, rng), (
                         info,
                         env_state_vid,
                         dones_vid,
+                        rewards_vid,
                     )
 
                 rng, reset_rng = jax.random.split(rng)
@@ -660,7 +667,7 @@ def make_train(config):
                     None,
                     eval_num_steps,
                 )
-                infos, env_states, dones = output
+                infos, env_states, dones, rewards = output
 
                 should_record_video = eval_record_video and eval_video_max_steps > 0 and (
                     eval_video_mods if is_mod else eval_video_base
@@ -671,18 +678,21 @@ def make_train(config):
                         lambda value: value[:video_steps], env_states
                     )
                     video_dones = dones[:video_steps]
+                    video_rewards = rewards[:video_steps]
                     jax.debug.callback(
                         partial(
-                            video_callback,
+                            evaluation_video_callback,
                             renderer=eval_renderer,
-                            mod=is_mod,
-                            mod_name=label.removeprefix("mod/") if is_mod else None,
+                            eval_label=label,
+                            eval_every_steps=eval_every_steps,
                             fps=eval_video_fps,
-                            step_metric="num_env_steps",
                         ),
                         video_states,
                         video_dones,
+                        video_rewards,
                         train_state.timesteps,
+                        periodic_video_due,
+                        final_video_due,
                     )
 
                 returned = infos["returned_episode"].squeeze()
@@ -911,6 +921,8 @@ def single_run(config):
     wandb.define_metric("num_updates")
     wandb.define_metric("num_env_steps")
     wandb.define_metric("eval/*", step_metric="num_env_steps")
+    wandb.define_metric("video/*", step_metric="num_env_steps")
+    wandb.define_metric("video_metrics/*", step_metric="num_env_steps")
 
     rng = jax.random.PRNGKey(config["SEED"])
 

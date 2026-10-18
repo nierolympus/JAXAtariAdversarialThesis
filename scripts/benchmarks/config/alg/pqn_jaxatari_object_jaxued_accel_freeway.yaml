@@ -23,6 +23,7 @@ ADV_WRAPPER: "freeway"
 OBJECT_CENTRIC: true
 TRAIN_MODS: null
 JAXUED_ALG: "accel"
+PROFILE: "full27"
 
 # Three independently mutable parameters. The Cartesian product contains
 # 3 * 3 * 3 = 27 levels, including exact base Freeway [1.0, 8, 10].
@@ -43,17 +44,20 @@ JAXUED_SCORE_FUNCTION: "q_pvl"
 EXPLORATORY_GRAD_UPDATES: true
 BUFFER_DUPLICATE_CHECK: true
 
-# The runner always evaluates base first, followed by these two fixed mods.
+# The runner always evaluates base first, followed by these three fixed mods.
 EVAL_DURING_TRAINING: true
 EVAL_EVERY_STEPS: 1000000
 EVAL_NUM_ENVS: 128
 EVAL_NUM_STEPS: 10000
 EVAL_SEED: 20261014
 FINAL_EVAL: true
-EVAL_MODS: ["slow_cars", "stop_all_cars"]
+EVAL_MODS: ["stop_all_cars", "invert_speed", "static_cars"]
+EPS_TEST: 0.0
 EVAL_RECORD_VIDEO: true
 EVAL_VIDEO_BASE: true
 EVAL_VIDEO_MODS: true
+EVAL_VIDEO_MAX_STEPS: 1000
+EVAL_VIDEO_FPS: 30
 TRAIN_RECORD_ACCEL_VIDEO: true
 
 HYP_TUNE: false

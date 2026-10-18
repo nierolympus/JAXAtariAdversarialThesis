@@ -18,6 +18,11 @@ FROSTBITE_MOD_REGISTRY = {
     "_static_ice": _StaticIceMod,
     "_misaligned_ice": _MisalignedIceMod,
     "_aligned_ice": _AlignedIceMod,
+    # Public single-mod names used by held-out benchmark evaluation.  Keep the
+    # underscored entries for the existing composite recipes below.
+    "static_ice": _StaticIceMod,
+    "misaligned_ice": _MisalignedIceMod,
+    "aligned_ice": _AlignedIceMod,
     "static_aligned_ice": ["_static_ice", "_aligned_ice"],
     "static_misaligned_ice": ["_static_ice", "_misaligned_ice"],
     "change_sprites": ["tiger", "white_igloo", "recolored_obstacles", "lightblue_ice"]

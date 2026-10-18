@@ -24,7 +24,8 @@ ENV_KWARGS: {}
 OBJECT_CENTRIC: true
 TRAIN_MODS: null
 
-# pqn_agent evaluates the unmodified game first and then these two mods.
+# pqn_agent evaluates the unmodified game first and then the three held-out
+# Freeway robustness mods requested for the comparison matrix.
 EVAL_DURING_TRAINING: true
 EVAL_EVERY_STEPS: 1000000
 EVAL_NUM_ENVS: 128
@@ -32,8 +33,11 @@ EVAL_NUM_STEPS: 10000
 EVAL_SEED: 20261014
 EPS_TEST: 0.0
 FINAL_EVAL: true
-EVAL_MODS: ["slow_cars", "stop_all_cars"]
+EVAL_MODS: ["stop_all_cars", "invert_speed", "static_cars"]
 EVAL_RECORD_VIDEO: true
 EVAL_VIDEO_BASE: true
 EVAL_VIDEO_MODS: true
-RECORD_FINAL_VIDEO: true
+EVAL_VIDEO_MAX_STEPS: 1000
+EVAL_VIDEO_FPS: 30
+# FINAL_EVAL already logs video/final/* through the shared W&B video callback.
+RECORD_FINAL_VIDEO: false

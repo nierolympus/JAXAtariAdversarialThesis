@@ -542,6 +542,162 @@ class FreewayAccelModWrapper(GameAccelModWrapper):
         )
 
 
+class FrostbiteAccelModWrapper(GameAccelModWrapper):
+    """Frostbite ACCEL levels expressed as native-speed multipliers.
+
+    Frostbite stores movement as whole pixels plus sixteenths of a pixel and
+    recomputes those values whenever the game advances a level.  Replacing the
+    raw state fields with fixed values would therefore destroy normal level
+    scaling and make the nominal baseline diverge from the base game.  This
+    adapter instead asks the core game for the current level's native speeds on
+    every raw frame, scales those fixed-point values, and writes the resulting
+    whole/fraction pairs before physics runs.
+
+    The three ``GenericModSpec`` instances below are level-coordinate
+    descriptors only.  Their normal post-step delta path is disabled because
+    the corresponding dynamics must be installed before Frostbite physics.
+    """
+
+    def __init__(
+        self,
+        env,
+        level_encoding: str = "parameter_vector",
+        parameter_ice_speed_multipliers: Sequence[float] = (1.0, 1.5, 2.0),
+        parameter_obstacle_speed_multipliers: Sequence[float] = (1.0, 1.5, 2.0),
+        parameter_player_speed_multipliers: Sequence[float] = (0.75, 1.0),
+    ):
+        parameter_groups = (
+            (
+                "ACCEL_PARAMETER_ICE_SPEED_MULTIPLIERS",
+                tuple(float(value) for value in parameter_ice_speed_multipliers),
+                0.0,
+                3.0,
+            ),
+            (
+                "ACCEL_PARAMETER_OBSTACLE_SPEED_MULTIPLIERS",
+                tuple(
+                    float(value)
+                    for value in parameter_obstacle_speed_multipliers
+                ),
+                0.5,
+                3.0,
+            ),
+            (
+                "ACCEL_PARAMETER_PLAYER_SPEED_MULTIPLIERS",
+                tuple(float(value) for value in parameter_player_speed_multipliers),
+                0.5,
+                1.5,
+            ),
+        )
+        for config_name, values, minimum, maximum in parameter_groups:
+            if not values:
+                raise ValueError(f"{config_name} must contain at least one value.")
+            if any(not minimum <= value <= maximum for value in values):
+                raise ValueError(
+                    f"{config_name} values must be in [{minimum}, {maximum}]."
+                )
+            if 1.0 not in values:
+                raise ValueError(
+                    f"{config_name} must include neutral Frostbite value 1.0."
+                )
+
+        speed_specs = (
+            GenericModSpec(target="ice_speed_frac", dtype=jnp.int32),
+            GenericModSpec(target="obstacle_speed_frac", dtype=jnp.int32),
+            GenericModSpec(target="bailey_speed_frac", dtype=jnp.int32),
+        )
+        super().__init__(
+            env,
+            game_name="frostbite",
+            parameter_names=(
+                "ice_speed_multiplier",
+                "obstacle_speed_multiplier",
+                "player_speed_multiplier",
+            ),
+            short_labels=("IS", "OS", "PS"),
+            mod_specs=speed_specs,
+            level_encoding=level_encoding,
+            parameter_values=[group[1] for group in parameter_groups],
+        )
+
+    @staticmethod
+    def _scale_fixed_point_speed(whole, fraction, multiplier):
+        """Scale a non-negative 4-bit fixed-point speed and split it again."""
+        raw_speed = (
+            jnp.asarray(whole, dtype=jnp.int32) * 16
+            + jnp.asarray(fraction, dtype=jnp.int32)
+        )
+        scaled_speed = jnp.maximum(
+            0,
+            jnp.rint(raw_speed.astype(jnp.float32) * multiplier).astype(jnp.int32),
+        )
+        return scaled_speed // 16, scaled_speed % 16
+
+    def _apply_speed_multipliers(
+        self,
+        state,
+        ice_multiplier,
+        obstacle_multiplier,
+        player_multiplier,
+    ):
+        core_state = _get_core_env_state(state)
+        native = self._core_env._calculate_speeds_for_level(core_state.level)
+        ice_whole, ice_frac = self._scale_fixed_point_speed(
+            native["ice_speed_whole"],
+            native["ice_speed_frac"],
+            ice_multiplier,
+        )
+        obstacle_whole, obstacle_frac = self._scale_fixed_point_speed(
+            native["obstacle_speed_whole"],
+            native["obstacle_speed_frac"],
+            obstacle_multiplier,
+        )
+        jump_whole, jump_frac = self._scale_fixed_point_speed(
+            native["bailey_jump_speed_whole"],
+            native["bailey_jump_speed_frac"],
+            player_multiplier,
+        )
+        walk_whole, walk_frac = self._scale_fixed_point_speed(
+            native["bailey_walk_speed_whole"],
+            native["bailey_walk_speed_frac"],
+            player_multiplier,
+        )
+        core_state = core_state.replace(
+            ice_speed_whole=ice_whole,
+            ice_speed_frac=ice_frac,
+            obstacle_speed_whole=obstacle_whole,
+            obstacle_speed_frac=obstacle_frac,
+            bailey_jump_speed_whole=jump_whole,
+            bailey_jump_speed_frac=jump_frac,
+            bailey_speed_whole=walk_whole,
+            bailey_speed_frac=walk_frac,
+        )
+        return _set_core_env_state(state, core_state)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _apply_pre_step_mods(self, state, level_mask, strength=1.0):
+        multipliers = jnp.where(
+            jnp.asarray(level_mask, dtype=bool),
+            jnp.asarray(strength, dtype=jnp.float32),
+            1.0,
+        )
+        return self._apply_speed_multipliers(state, *multipliers)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _apply_pre_step_parameters(self, state, parameter_values):
+        return self._apply_speed_multipliers(state, *parameter_values)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _apply_level_deltas(self, pre_state, post_state, level_mask, strength):
+        del pre_state, level_mask, strength
+        return post_state
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _apply_parameter_deltas(self, pre_state, post_state, parameter_values):
+        del pre_state, parameter_values
+        return post_state
+
+
 class StructuredLevelAccelWrapper(JaxatariWrapper):
     """Reusable ACCEL lifecycle for first-class structured level PyTrees.
 

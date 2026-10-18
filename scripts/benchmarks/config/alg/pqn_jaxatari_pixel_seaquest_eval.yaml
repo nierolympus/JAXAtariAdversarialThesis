@@ -1,4 +1,5 @@
-# Pixel counterpart of the evaluated plain Seaquest PQN baseline.
+# Pixel counterpart of the evaluated plain Seaquest PQN baseline. This run has
+# no ACCEL wrapper but retains LogWrapper plus PQN evaluation/video logging.
 
 ALG_NAME: "pqn"
 NAME: "seaquest_base_pixel_eval"
@@ -33,8 +34,9 @@ EVAL_NUM_ENVS: 128
 EVAL_NUM_STEPS: 10000
 EPS_TEST: 0.0
 FINAL_EVAL: true
-EVAL_MODS: ["gravity"]
+EVAL_MODS: ["vertical_oscillation", "faster_enemies", "continuous_random_spawns"]
 EVAL_RECORD_VIDEO: true
 EVAL_VIDEO_BASE: true
 EVAL_VIDEO_MODS: true
-RECORD_FINAL_VIDEO: true
+# FINAL_EVAL already writes video/final/* through the shared W&B video logger.
+RECORD_FINAL_VIDEO: false

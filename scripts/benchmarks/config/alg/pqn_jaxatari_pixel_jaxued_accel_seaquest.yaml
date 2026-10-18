@@ -47,13 +47,13 @@ TEMPERATURE: 0.90
 JAXUED_SCORE_FUNCTION: "q_pvl"
 EXPLORATORY_GRAD_UPDATES: true
 
-# Identical base-Seaquest and gravity evaluation suite.
+# Identical base-Seaquest and three-mod robustness evaluation suite.
 EVAL_DURING_TRAINING: true
 EVAL_EVERY_STEPS: 1000000
 EVAL_NUM_ENVS: 128
 EVAL_NUM_STEPS: 10000
 FINAL_EVAL: true
-EVAL_MODS: ["gravity"]
+EVAL_MODS: ["vertical_oscillation", "faster_enemies", "continuous_random_spawns"]
 EVAL_RECORD_VIDEO: true
 EVAL_VIDEO_BASE: true
 EVAL_VIDEO_MODS: true

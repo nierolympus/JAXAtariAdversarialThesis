@@ -42,6 +42,7 @@ from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from jaxatari.accel_wrappers import (
     FreewayAccelModWrapper,
+    FrostbiteAccelModWrapper,
     KangarooAccelWrapper,
     PongAccelModWrapper,
     SeaquestAccelModWrapper,
@@ -57,7 +58,7 @@ from jaxatari.wrappers import (
 from omegaconf import OmegaConf
 
 from pqn_agent_adv_random import QNetwork, Transition
-from train_utils import save_params
+from train_utils import log_wandb_video, save_params
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -714,6 +715,28 @@ def _make_freeway_accel_wrapper(atari_env, config, level_encoding: str):
     )
 
 
+def _make_frostbite_accel_wrapper(atari_env, config, level_encoding: str):
+    return FrostbiteAccelModWrapper(
+        atari_env,
+        level_encoding=level_encoding,
+        parameter_ice_speed_multipliers=_float_tuple_config(
+            config,
+            "ACCEL_PARAMETER_ICE_SPEED_MULTIPLIERS",
+            (1.0, 1.5, 2.0),
+        ),
+        parameter_obstacle_speed_multipliers=_float_tuple_config(
+            config,
+            "ACCEL_PARAMETER_OBSTACLE_SPEED_MULTIPLIERS",
+            (1.0, 1.5, 2.0),
+        ),
+        parameter_player_speed_multipliers=_float_tuple_config(
+            config,
+            "ACCEL_PARAMETER_PLAYER_SPEED_MULTIPLIERS",
+            (0.75, 1.0),
+        ),
+    )
+
+
 def _make_seaquest_accel_wrapper(atari_env, config, level_encoding: str):
     return SeaquestAccelModWrapper(
         atari_env,
@@ -764,6 +787,7 @@ def _make_kangaroo_accel_wrapper(atari_env, config, level_encoding: str):
 
 ACCEL_WRAPPER_FACTORIES = {
     "freeway": _make_freeway_accel_wrapper,
+    "frostbite": _make_frostbite_accel_wrapper,
     "kangaroo": _make_kangaroo_accel_wrapper,
     "pong": _make_pong_accel_wrapper,
     "seaquest": _make_seaquest_accel_wrapper,
@@ -1174,8 +1198,14 @@ def make_train_jaxatari_accel_plr(config):
     if eval_seed is not None:
         eval_seed = int(eval_seed)
     default_eval_mods = {
-        "freeway": ["slow_cars", "stop_all_cars"],
-        "pong": ["lazy_enemy"],
+        "freeway": ["stop_all_cars", "invert_speed", "static_cars"],
+        "frostbite": ["static_ice", "misaligned_ice", "aligned_ice"],
+        "pong": ["lazy_enemy", "random_enemy", "linear_movement"],
+        "seaquest": [
+            "vertical_oscillation",
+            "faster_enemies",
+            "continuous_random_spawns",
+        ],
     }.get(adv_wrapper, [])
     eval_mods = _as_list(
         config.get("EVAL_MODS", config.get("MOD_NAME", default_eval_mods))
@@ -2051,17 +2081,14 @@ def make_train_jaxatari_accel_plr(config):
                     )
         else:
             video_caption = "Evaluation rollout without an ACCEL level."
-        video_payload = {
-            "num_env_steps": env_step,
-            f"video/{label}": wandb.Video(
-                np.transpose(frames, (0, 3, 1, 2)),
-                fps=eval_video_fps,
-                format="mp4",
-                caption=video_caption,
-            ),
-        }
-        wandb.log(video_payload, step=env_step)
-        wandb.log(metrics_payload, step=env_step)
+        log_wandb_video(
+            frames,
+            label=label,
+            env_step=env_step,
+            fps=eval_video_fps,
+            caption=video_caption,
+            metrics_payload=metrics_payload,
+        )
 
     def _build_eval_fn(eval_env):
         @jax.jit
